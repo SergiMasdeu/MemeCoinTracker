@@ -1,0 +1,28 @@
+:root {
+  --bg-start: #04111f;
+  --bg-end: #021018;
+  --surface-border: rgba(153, 210, 224, 0.24);
+  --text-main: #ddf2ff;
+
+  font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+  line-height: 1.45;
+  font-weight: 500;
+  color: var(--text-main);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 20% 10%, rgba(24, 106, 111, 0.35), transparent 35%),
+    radial-gradient(circle at 85% 20%, rgba(30, 88, 150, 0.26), transparent 30%),
+    linear-gradient(160deg, var(--bg-start), var(--bg-end));
+}
+
+a {
+  color: inherit;
+}
