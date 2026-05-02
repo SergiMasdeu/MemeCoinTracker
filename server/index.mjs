@@ -1,5 +1,13 @@
 import express from 'express';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const CLIENT_DIST_DIR = path.resolve(__dirname, '../dist');
+const HAS_CLIENT_BUILD = fs.existsSync(path.join(CLIENT_DIST_DIR, 'index.html'));
 
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
@@ -72,6 +80,10 @@ const AUTO_START_BOT = process.env.AUTO_START_BOT !== 'false';
 
 app.use(cors());
 app.use(express.json());
+
+if (HAS_CLIENT_BUILD) {
+  app.use(express.static(CLIENT_DIST_DIR));
+}
 
 const PHASES = {
   PHASE_1: 'PHASE_1_FIRST_PUMP',
@@ -1955,6 +1967,19 @@ app.get('/api/market', (_req, res) => {
     tradingViewSignals: tradingViewSignalsPayload,
     ts: Date.now(),
   });
+});
+
+app.get('/', (_req, res) => {
+  if (!HAS_CLIENT_BUILD) {
+    return res.status(404).send('Frontend build not found. Build with "npm run build" before starting the server.');
+  }
+  return res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
+});
+
+app.get(/^(?!\/api\/).*/, (req, res, next) => {
+  if (req.method !== 'GET') return next();
+  if (!HAS_CLIENT_BUILD) return next();
+  return res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
 });
 
 app.listen(PORT, async () => {
