@@ -640,11 +640,11 @@ function phase4Signal(coin) {
 function phase1BuySignal(coin) {
   const prices = coin.history;
   // Need at least 2 data points to confirm upward movement
-  const minBuySellRatio = 1.1;
-  const minVelocityPct = 0.2;  // tick-based fallback threshold
-  const minH1Pct = 2;          // h1 price change threshold when DexScreener data available
-  const maxCreatorOwnershipPct = 30;
-  const minActiveUsers = 10;
+  const minBuySellRatio = 1.0;
+  const minVelocityPct = 0.1;  // tick-based fallback threshold
+  const minH1Pct = 1;          // h1 price change threshold when DexScreener data available
+  const maxCreatorOwnershipPct = 35;
+  const minActiveUsers = 8;
   if (prices.length < 2) {
     return {
       value: false,
@@ -695,7 +695,7 @@ function phase1BuySignal(coin) {
   }
   const hasVelocity = lastMovePct > (pc && pc.h1 !== 0 ? minH1Pct - 0.01 : minVelocityPct);
 
-  const value = rising && hasVelocity && buyPressure && flowAcceptable && highActivity && notOverbought && shortMomentumOk;
+  const value = rising && hasVelocity && buyPressure && flowAcceptable && highActivity && notOverbought;
   return {
     value,
     reason: value ? 'early-pump-with-strong-buy-pressure' : 'p1-signal-not-confirmed',
@@ -866,10 +866,8 @@ function summarizeCoin(coin) {
       && indicators.macdHistogram >= P3_MIN_MACD_HISTOGRAM
     );
   const p1EntryQualityOk = entryQuality.drawdownOk
-    && entryQuality.shortMomentumOk
     && entryQuality.flowOk
     && entryQuality.liquidityOk
-    && entryQuality.volumeLiqOk
     && p1CandlestickOk
     && p1IndicatorOk;
   const p3EntryQualityOk = entryQuality.drawdownOk
@@ -918,7 +916,6 @@ function summarizeCoin(coin) {
     phase.phase === PHASES.PHASE_1
     && phase1.value
     && marketCapOk
-    && socialOk
     && youngEnoughForP1
     && p1EntryQualityOk
   ) || p1EarlyIndicatorOverride;
