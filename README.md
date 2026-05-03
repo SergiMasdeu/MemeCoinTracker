@@ -68,6 +68,13 @@ Phase 1 entry thresholds:
 - `P1_RSI_MAX` (default `78`)
 - `P1_ALLOW_PRICE_ABOVE_FAST_EMA` (default `true`)
 - `P1_MIN_MACD_HISTOGRAM` (default `-0.00000001`)
+- `P1_EARLY_INDICATOR_OVERRIDE_ENABLED` (default `true`)
+- `P1_EARLY_MAX_HISTORY_POINTS` (default `6`)
+- `P1_EARLY_MIN_BUY_SELL_RATIO` (default `1.45`)
+- `P1_EARLY_MIN_ACTIVE_USERS` (default `20`)
+- `P1_EARLY_RSI_MIN` (default `52`)
+- `P1_EARLY_RSI_MAX` (default `76`)
+- `P1_EARLY_MIN_MACD_HISTOGRAM` (default `0`)
 
 Phase 3 breakout entry thresholds:
 

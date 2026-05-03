@@ -102,6 +102,14 @@ const P1_RSI_MIN = Number(process.env.P1_RSI_MIN || 48);
 const P1_RSI_MAX = Number(process.env.P1_RSI_MAX || 78);
 const P1_ALLOW_PRICE_ABOVE_FAST_EMA = envBoolean('P1_ALLOW_PRICE_ABOVE_FAST_EMA', true);
 const P1_MIN_MACD_HISTOGRAM = Number(process.env.P1_MIN_MACD_HISTOGRAM || -0.00000001);
+// Optional early P1 entry: allow buying before normal P1 signal only on very strong indicators.
+const P1_EARLY_INDICATOR_OVERRIDE_ENABLED = envBoolean('P1_EARLY_INDICATOR_OVERRIDE_ENABLED', true);
+const P1_EARLY_MAX_HISTORY_POINTS = Number(process.env.P1_EARLY_MAX_HISTORY_POINTS || 6);
+const P1_EARLY_MIN_BUY_SELL_RATIO = Number(process.env.P1_EARLY_MIN_BUY_SELL_RATIO || 1.45);
+const P1_EARLY_MIN_ACTIVE_USERS = Number(process.env.P1_EARLY_MIN_ACTIVE_USERS || 20);
+const P1_EARLY_RSI_MIN = Number(process.env.P1_EARLY_RSI_MIN || 52);
+const P1_EARLY_RSI_MAX = Number(process.env.P1_EARLY_RSI_MAX || 76);
+const P1_EARLY_MIN_MACD_HISTOGRAM = Number(process.env.P1_EARLY_MIN_MACD_HISTOGRAM || 0);
 const P3_RSI_MIN = Number(process.env.P3_RSI_MIN || 50);
 const P3_RSI_MAX = Number(process.env.P3_RSI_MAX || 72);
 const P3_REQUIRE_TREND_UP = envBoolean('P3_REQUIRE_TREND_UP', true);
@@ -886,9 +894,34 @@ function summarizeCoin(coin) {
   // P1: fresh coin only (< 3h). No confidence gate — P1 targets brand-new coins with short history
   // by design. The phase1BuySignal already validates momentum.
   const youngEnoughForP1 = coinAgeMs <= MAX_COIN_AGE_P1_MS;
+  const p1EarlyIndicatorOverride = P1_EARLY_INDICATOR_OVERRIDE_ENABLED
+    && phase.phase === PHASES.PHASE_1
+    && youngEnoughForP1
+    && marketCapOk
+    && socialOk
+    && prices.length <= P1_EARLY_MAX_HISTORY_POINTS
+    && indicators.dataReady
+    && indicators.rsi >= P1_EARLY_RSI_MIN
+    && indicators.rsi <= P1_EARLY_RSI_MAX
+    && indicators.trendUp
+    && indicators.priceAboveFastEma
+    && indicators.macdHistogram >= P1_EARLY_MIN_MACD_HISTOGRAM
+    && buySellRatio >= P1_EARLY_MIN_BUY_SELL_RATIO
+    && coin.activeUsers >= P1_EARLY_MIN_ACTIVE_USERS
+    && coin.capitalFlow > 0
+    && entryQuality.drawdownOk
+    && entryQuality.shortMomentumOk
+    && entryQuality.liquidityOk
+    && entryQuality.volumeLiqOk;
   const p1CoreOk = phase.phase === PHASES.PHASE_1 && phase1.value && marketCapOk && youngEnoughForP1;
-  const canBuyP1 = phase.phase === PHASES.PHASE_1 && phase1.value
-    && marketCapOk && socialOk && youngEnoughForP1 && p1EntryQualityOk;
+  const canBuyP1 = (
+    phase.phase === PHASES.PHASE_1
+    && phase1.value
+    && marketCapOk
+    && socialOk
+    && youngEnoughForP1
+    && p1EntryQualityOk
+  ) || p1EarlyIndicatorOverride;
   const canBuyP1Tv = p1CoreOk && tvBoost && p1EntryQualityOk;
 
   // P3→P4: needs long history + high confidence since phase-3 detection is nuanced
@@ -900,7 +933,9 @@ function summarizeCoin(coin) {
   const canBuyP3Tv = p3CoreOk && tvBoost && p3EntryQualityOk && phase.confidence >= Math.max(minP3Confidence - 0.08, 0.62);
 
   const canBuy = canBuyP1 || canBuyP3 || canBuyP1Tv || canBuyP3Tv;
-  const buyReason = canBuyP1
+  const buyReason = p1EarlyIndicatorOverride
+    ? (tvBoost ? 'P1 Early Indicator Override + TV Pattern' : 'P1 Early Indicator Override')
+    : canBuyP1
     ? (tvBoost ? 'P1 Early Pump + TV Pattern' : 'P1 Early Pump')
     : canBuyP1Tv
       ? 'P1 TV Pattern Override'
@@ -1024,6 +1059,13 @@ function summarizeCoin(coin) {
           p1RsiMax: P1_RSI_MAX,
           p1AllowPriceAboveFastEma: P1_ALLOW_PRICE_ABOVE_FAST_EMA,
           p1MinMacdHistogram: P1_MIN_MACD_HISTOGRAM,
+          p1EarlyIndicatorOverrideEnabled: P1_EARLY_INDICATOR_OVERRIDE_ENABLED,
+          p1EarlyMaxHistoryPoints: P1_EARLY_MAX_HISTORY_POINTS,
+          p1EarlyMinBuySellRatio: P1_EARLY_MIN_BUY_SELL_RATIO,
+          p1EarlyMinActiveUsers: P1_EARLY_MIN_ACTIVE_USERS,
+          p1EarlyRsiMin: P1_EARLY_RSI_MIN,
+          p1EarlyRsiMax: P1_EARLY_RSI_MAX,
+          p1EarlyMinMacdHistogram: P1_EARLY_MIN_MACD_HISTOGRAM,
           p3RsiMin: P3_RSI_MIN,
           p3RsiMax: P3_RSI_MAX,
           p3RequireTrendUp: P3_REQUIRE_TREND_UP,
