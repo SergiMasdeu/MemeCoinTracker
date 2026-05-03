@@ -14,6 +14,14 @@ const PORT = Number(process.env.PORT || 8787);
 const BOT_INTERVAL_MS = Number(process.env.BOT_INTERVAL_MS || 7000);
 const PRICE_REFRESH_MS = Number(process.env.PRICE_REFRESH_MS || 1000);
 const USE_REAL_DATA = process.env.USE_REAL_DATA !== 'false';
+
+function envBoolean(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  const normalized = String(raw).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
 const STARTING_BALANCE_USD = Number(process.env.STARTING_BALANCE_USD || 10_000);
 // Minimum time to hold before stop-loss or phase-break can trigger (2 minutes)
 const MIN_HOLD_MS = Number(process.env.MIN_HOLD_MS || 120_000);
@@ -46,6 +54,12 @@ const MIN_ENTRY_ACTIVE_USERS_NO_LIQ = Number(process.env.MIN_ENTRY_ACTIVE_USERS_
 const MIN_VOL_LIQ_RATIO = Number(process.env.MIN_VOL_LIQ_RATIO || 0.35);
 const MAX_VOL_LIQ_RATIO = Number(process.env.MAX_VOL_LIQ_RATIO || 30);
 const MIN_CANDLE_BULLISH_SCORE = Number(process.env.MIN_CANDLE_BULLISH_SCORE || 0.55);
+// Phase classification tuning (helps detect P3 stabilization before broad crash buckets)
+const P3_MIN_DRAWDOWN_FROM_ATH = Number(process.env.P3_MIN_DRAWDOWN_FROM_ATH || 0.20);
+const P3_MAX_RECENT_RANGE = Number(process.env.P3_MAX_RECENT_RANGE || 0.22);
+const P3_MAX_ABS_RECENT_SLOPE = Number(process.env.P3_MAX_ABS_RECENT_SLOPE || 0.08);
+const P3_MAX_SINGLE_TICK_DROP_PCT = Number(process.env.P3_MAX_SINGLE_TICK_DROP_PCT || 6);
+const P2_MAX_FLAT_SLOPE_FOR_CRASH = Number(process.env.P2_MAX_FLAT_SLOPE_FOR_CRASH || -0.015);
 // Recheck skipped symbols after cooldown instead of suppressing forever.
 const SKIP_RECHECK_MS = Number(process.env.SKIP_RECHECK_MS || 3 * 60 * 1000);
 // Entry execution safety: avoid buying into immediate reversals and cut instant dumps.
@@ -75,6 +89,25 @@ const DEFAULT_BREAKEVEN_FLOOR_PCT = Number(process.env.BREAKEVEN_FLOOR_PCT || 1.
 // If trade is still profitable after this hold duration, take the profit and rotate capital
 const DEFAULT_PROFIT_TIME_EXIT_MS = Number(process.env.PROFIT_TIME_EXIT_MS || 30 * 60 * 1000);
 const DEFAULT_PROFIT_TIME_EXIT_MIN_PCT = Number(process.env.PROFIT_TIME_EXIT_MIN_PCT || 3);
+// Indicator configuration and thresholds (entry + exits)
+const INDICATOR_RSI_PERIOD = Number(process.env.INDICATOR_RSI_PERIOD || 14);
+const INDICATOR_EMA_FAST_PERIOD = Number(process.env.INDICATOR_EMA_FAST_PERIOD || 9);
+const INDICATOR_EMA_SLOW_PERIOD = Number(process.env.INDICATOR_EMA_SLOW_PERIOD || 21);
+const INDICATOR_MACD_FAST_PERIOD = Number(process.env.INDICATOR_MACD_FAST_PERIOD || 12);
+const INDICATOR_MACD_SLOW_PERIOD = Number(process.env.INDICATOR_MACD_SLOW_PERIOD || 26);
+const INDICATOR_MACD_SIGNAL_PERIOD = Number(process.env.INDICATOR_MACD_SIGNAL_PERIOD || 9);
+const P1_RSI_MIN = Number(process.env.P1_RSI_MIN || 48);
+const P1_RSI_MAX = Number(process.env.P1_RSI_MAX || 78);
+const P1_ALLOW_PRICE_ABOVE_FAST_EMA = envBoolean('P1_ALLOW_PRICE_ABOVE_FAST_EMA', true);
+const P1_MIN_MACD_HISTOGRAM = Number(process.env.P1_MIN_MACD_HISTOGRAM || -0.00000001);
+const P3_RSI_MIN = Number(process.env.P3_RSI_MIN || 50);
+const P3_RSI_MAX = Number(process.env.P3_RSI_MAX || 72);
+const P3_REQUIRE_TREND_UP = envBoolean('P3_REQUIRE_TREND_UP', true);
+const P3_REQUIRE_PRICE_ABOVE_FAST_EMA = envBoolean('P3_REQUIRE_PRICE_ABOVE_FAST_EMA', true);
+const P3_MIN_MACD_HISTOGRAM = Number(process.env.P3_MIN_MACD_HISTOGRAM || 0);
+const SELL_RSI_OVERBOUGHT_THRESHOLD = Number(process.env.SELL_RSI_OVERBOUGHT_THRESHOLD || 75);
+const SELL_RSI_BREAKDOWN_THRESHOLD = Number(process.env.SELL_RSI_BREAKDOWN_THRESHOLD || 44);
+const SELL_REQUIRE_MACD_WEAKENING = envBoolean('SELL_REQUIRE_MACD_WEAKENING', true);
 // Start trading loop automatically when API boots
 const AUTO_START_BOT = process.env.AUTO_START_BOT !== 'false';
 
@@ -228,6 +261,18 @@ function detectPhase(prices) {
   // How compressed is the recent price range? (low = flat/stabilising)
   const recentRange = recentMin > 0 ? (recentMax - recentMin) / recentMin : 0;
 
+  const recentDeltasPct = [];
+  for (let i = 1; i < recentWindow.length; i += 1) {
+    const prev = recentWindow[i - 1];
+    const next = recentWindow[i];
+    recentDeltasPct.push(prev > 0 ? ((next - prev) / prev) * 100 : 0);
+  }
+  const positiveTicks = recentDeltasPct.filter((v) => v > 0).length;
+  const negativeTicks = recentDeltasPct.filter((v) => v < 0).length;
+  const maxSingleDropPct = recentDeltasPct.length > 0 ? Math.min(...recentDeltasPct) : 0;
+  const stableOscillation = positiveTicks > 0 && negativeTicks > 0;
+  const noHardRecentDump = maxSingleDropPct >= -P3_MAX_SINGLE_TICK_DROP_PCT;
+
   // ---- Post-peak rebound from crash low ----
   const postPeakPrices = prices.slice(maxIndex);
   const postPeakMin = postPeakPrices.length > 0 ? Math.min(...postPeakPrices) : latest;
@@ -254,11 +299,30 @@ function detectPhase(prices) {
   }
 
   // ================================================================
+  // P3 — STABILISATION
+  // Graph shape: big crash has happened, but recent prices are FLAT
+  // and compressed — the coin is finding a floor (tight coil).
+  // ================================================================
+  if (
+    drawdownFromATH >= P3_MIN_DRAWDOWN_FROM_ATH
+    && recentRange <= P3_MAX_RECENT_RANGE
+    && Math.abs(recentSlope) <= P3_MAX_ABS_RECENT_SLOPE
+    && noHardRecentDump
+    && (stableOscillation || Math.abs(recentSlope) <= 0.02)
+  ) {
+    const conf = Math.min(0.92, 0.64 + (P3_MAX_RECENT_RANGE - recentRange) * 1.8 + Math.min(0.12, drawdownFromATH * 0.25));
+    return {
+      phase: PHASES.PHASE_3, confidence: conf,
+      reason: `Base forming: range ${(recentRange * 100).toFixed(1)}%, slope ${(recentSlope * 100).toFixed(1)}%, drawdown -${(drawdownFromATH * 100).toFixed(0)}%`,
+    };
+  }
+
+  // ================================================================
   // P2 — CRASH
   // Graph shape: ATH was EARLY in the series, price has since dropped
-  // sharply (>25%), recent ticks are still negative or flat-down.
+  // sharply, and recent ticks are still meaningfully down.
   // ================================================================
-  if (peakPosition < 0.55 && drawdownFromATH >= 0.25 && recentSlope <= 0.02 && rebound < 0.18) {
+  if (peakPosition < 0.55 && drawdownFromATH >= 0.25 && recentSlope <= P2_MAX_FLAT_SLOPE_FOR_CRASH && rebound < 0.18) {
     const conf = Math.min(0.90, 0.60 + drawdownFromATH * 0.50);
     return {
       phase: PHASES.PHASE_2, confidence: conf,
@@ -271,19 +335,6 @@ function detectPhase(prices) {
     return {
       phase: PHASES.PHASE_2, confidence: 0.80,
       reason: `Heavy sell-off: -${(drawdownFromATH * 100).toFixed(0)}% drawdown, recent slope ${(recentSlope * 100).toFixed(1)}%`,
-    };
-  }
-
-  // ================================================================
-  // P3 — STABILISATION
-  // Graph shape: big crash has happened, but recent prices are FLAT
-  // and compressed — the coin is finding a floor (tight coil).
-  // ================================================================
-  if (drawdownFromATH >= 0.25 && recentRange <= 0.15 && Math.abs(recentSlope) < 0.06) {
-    const conf = Math.min(0.92, 0.65 + (0.15 - recentRange) * 2 + Math.min(0.10, drawdownFromATH * 0.20));
-    return {
-      phase: PHASES.PHASE_3, confidence: conf,
-      reason: `Flat base: recent range ${(recentRange * 100).toFixed(1)}% after -${(drawdownFromATH * 100).toFixed(0)}% crash`,
     };
   }
 
@@ -394,6 +445,134 @@ function analyzeCandlestick(prices) {
       hammerRejection,
       threeWhiteSoldiers,
       bearishPressure,
+    },
+  };
+}
+
+function calculateEMA(values, period) {
+  if (!Array.isArray(values) || values.length < period || period <= 1) return null;
+
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((acc, v) => acc + v, 0) / period;
+  for (let i = period; i < values.length; i += 1) {
+    ema = (values[i] - ema) * k + ema;
+  }
+  return ema;
+}
+
+function calculateRSI(values, period = 14) {
+  if (!Array.isArray(values) || values.length <= period) return null;
+
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i += 1) {
+    const delta = values[i] - values[i - 1];
+    if (delta >= 0) gains += delta;
+    else losses += Math.abs(delta);
+  }
+
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+
+  for (let i = period + 1; i < values.length; i += 1) {
+    const delta = values[i] - values[i - 1];
+    const gain = delta > 0 ? delta : 0;
+    const loss = delta < 0 ? Math.abs(delta) : 0;
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function calculateMACD(values, fast = 12, slow = 26, signal = 9) {
+  if (!Array.isArray(values) || values.length < slow + signal) {
+    return { line: null, signal: null, histogram: null };
+  }
+
+  const fastSeries = [];
+  const slowSeries = [];
+  let fastEma = values.slice(0, fast).reduce((acc, v) => acc + v, 0) / fast;
+  let slowEma = values.slice(0, slow).reduce((acc, v) => acc + v, 0) / slow;
+  const fastK = 2 / (fast + 1);
+  const slowK = 2 / (slow + 1);
+
+  for (let i = fast; i < values.length; i += 1) {
+    fastEma = (values[i] - fastEma) * fastK + fastEma;
+    fastSeries.push(fastEma);
+  }
+
+  for (let i = slow; i < values.length; i += 1) {
+    slowEma = (values[i] - slowEma) * slowK + slowEma;
+    slowSeries.push(slowEma);
+  }
+
+  const offset = slow - fast;
+  const macdSeries = slowSeries
+    .map((s, idx) => fastSeries[idx + offset] - s)
+    .filter((value) => Number.isFinite(value));
+
+  if (macdSeries.length < signal) {
+    return {
+      line: macdSeries[macdSeries.length - 1] ?? null,
+      signal: null,
+      histogram: null,
+    };
+  }
+
+  let signalEma = macdSeries.slice(0, signal).reduce((acc, v) => acc + v, 0) / signal;
+  const signalK = 2 / (signal + 1);
+  for (let i = signal; i < macdSeries.length; i += 1) {
+    signalEma = (macdSeries[i] - signalEma) * signalK + signalEma;
+  }
+
+  const line = macdSeries[macdSeries.length - 1];
+  const histogram = line - signalEma;
+  return {
+    line,
+    signal: signalEma,
+    histogram,
+  };
+}
+
+function analyzeIndicators(prices) {
+  const latest = prices?.[prices.length - 1] || 0;
+  const emaFast = calculateEMA(prices, INDICATOR_EMA_FAST_PERIOD);
+  const emaSlow = calculateEMA(prices, INDICATOR_EMA_SLOW_PERIOD);
+  const rsi = calculateRSI(prices, INDICATOR_RSI_PERIOD);
+  const macd = calculateMACD(
+    prices,
+    INDICATOR_MACD_FAST_PERIOD,
+    INDICATOR_MACD_SLOW_PERIOD,
+    INDICATOR_MACD_SIGNAL_PERIOD,
+  );
+
+  const trendUp = emaFast !== null && emaSlow !== null ? emaFast > emaSlow : false;
+  const priceAboveFastEma = emaFast !== null ? latest > emaFast : false;
+  const macdBullish = macd.histogram !== null ? macd.histogram >= 0 : false;
+  const macdWeakening = macd.histogram !== null ? macd.histogram < 0 : false;
+
+  return {
+    rsi: rsi === null ? null : Number(rsi.toFixed(2)),
+    emaFast: emaFast === null ? null : Number(emaFast.toFixed(10)),
+    emaSlow: emaSlow === null ? null : Number(emaSlow.toFixed(10)),
+    macdLine: macd.line === null ? null : Number(macd.line.toFixed(10)),
+    macdSignal: macd.signal === null ? null : Number(macd.signal.toFixed(10)),
+    macdHistogram: macd.histogram === null ? null : Number(macd.histogram.toFixed(10)),
+    trendUp,
+    priceAboveFastEma,
+    macdBullish,
+    macdWeakening,
+    dataReady: rsi !== null && emaFast !== null && emaSlow !== null && macd.histogram !== null,
+    thresholds: {
+      rsiPeriod: INDICATOR_RSI_PERIOD,
+      emaFastPeriod: INDICATOR_EMA_FAST_PERIOD,
+      emaSlowPeriod: INDICATOR_EMA_SLOW_PERIOD,
+      macdFastPeriod: INDICATOR_MACD_FAST_PERIOD,
+      macdSlowPeriod: INDICATOR_MACD_SLOW_PERIOD,
+      macdSignalPeriod: INDICATOR_MACD_SIGNAL_PERIOD,
     },
   };
 }
@@ -633,6 +812,7 @@ function summarizeCoin(coin) {
   const phase4 = phase4Signal(coin);
   const phase1 = phase1BuySignal(coin);
   const candlestick = analyzeCandlestick(prices);
+  const indicators = analyzeIndicators(prices);
   const tvSignal = TRADINGVIEW_ENABLED ? getTradingViewSignal(coin) : null;
   const tvBullish = tvSignal?.direction === 'bullish';
   const tvScoreOk = (tvSignal?.score || 0) >= TRADINGVIEW_MIN_BULLISH_SCORE;
@@ -661,18 +841,33 @@ function summarizeCoin(coin) {
     candlestickOk: candlestick.bullish,
   };
   const p1CandlestickOk = candlestick.bullish || candlestick.pattern === 'insufficient-data';
+  const p1IndicatorOk = !indicators.dataReady
+    || (
+      (indicators.rsi >= P1_RSI_MIN && indicators.rsi <= P1_RSI_MAX)
+      && (indicators.trendUp || (P1_ALLOW_PRICE_ABOVE_FAST_EMA && indicators.priceAboveFastEma))
+      && (indicators.macdBullish || indicators.macdHistogram >= P1_MIN_MACD_HISTOGRAM)
+    );
+  const p3IndicatorOk = !indicators.dataReady
+    || (
+      (indicators.rsi >= P3_RSI_MIN && indicators.rsi <= P3_RSI_MAX)
+      && (!P3_REQUIRE_TREND_UP || indicators.trendUp)
+      && (!P3_REQUIRE_PRICE_ABOVE_FAST_EMA || indicators.priceAboveFastEma)
+      && indicators.macdHistogram >= P3_MIN_MACD_HISTOGRAM
+    );
   const p1EntryQualityOk = entryQuality.drawdownOk
     && entryQuality.shortMomentumOk
     && entryQuality.flowOk
     && entryQuality.liquidityOk
     && entryQuality.volumeLiqOk
-    && p1CandlestickOk;
+    && p1CandlestickOk
+    && p1IndicatorOk;
   const p3EntryQualityOk = entryQuality.drawdownOk
     && entryQuality.shortMomentumOk
     && entryQuality.flowOk
     && entryQuality.liquidityOk
     && entryQuality.volumeLiqOk
-    && entryQuality.candlestickOk;
+    && entryQuality.candlestickOk
+    && p3IndicatorOk;
   const hasEnoughHistory = prices.length >= MIN_HISTORY_DEPTH; // used only for P3
   const confidenceOk = phase.confidence >= MIN_PHASE_CONFIDENCE; // used only for P3
   const marketCapOk = coin.marketCap >= 0 && coin.marketCap <= MAX_MARKETCAP_USD; // allow zero mcap on fresh coins
@@ -725,6 +920,8 @@ function summarizeCoin(coin) {
         : `no liquidity data: need ratio >= ${MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ} and users >= ${MIN_ENTRY_ACTIVE_USERS_NO_LIQ}`;
     }
     else if (!entryQuality.volumeLiqOk) skipReason = `vol/liq ${volLiqRatio.toFixed(2)} outside ${MIN_VOL_LIQ_RATIO}-${MAX_VOL_LIQ_RATIO}`;
+    else if (!p1IndicatorOk && phase.phase === PHASES.PHASE_1) skipReason = `indicators weak for P1 (RSI ${indicators.rsi ?? 'n/a'})`;
+    else if (!p3IndicatorOk && phase.phase === PHASES.PHASE_3) skipReason = `indicators weak for P3 (RSI ${indicators.rsi ?? 'n/a'})`;
     else if (!entryQuality.candlestickOk) skipReason = `candlestick weak (${candlestick.pattern}, score ${candlestick.score})`;
     else if (!socialOk) skipReason = `social ${social.verdict} (with data)`;
     else if (phase.phase === PHASES.PHASE_1 && !youngEnoughForP1) skipReason = `coin too old (${Math.round(coinAgeMs/60000)}m)`;
@@ -764,6 +961,7 @@ function summarizeCoin(coin) {
     phase4Signal: phase4,
     phase1Signal: phase1,
     candlestick,
+    indicators,
     trackHighValue24h: highValueTrackEligible,
     buyChecks: {
       path: canBuyP1 ? 'P1' : canBuyP3 ? 'P3_BREAKOUT' : null,
@@ -808,6 +1006,35 @@ function summarizeCoin(coin) {
         candlestickScore: candlestick.score,
         minCandleBullishScore: MIN_CANDLE_BULLISH_SCORE,
         candlestickOk: candlestick.bullish,
+        indicatorsReady: indicators.dataReady,
+        rsi: indicators.rsi,
+        emaFast: indicators.emaFast,
+        emaSlow: indicators.emaSlow,
+        indicatorThresholds: {
+          rsiPeriod: INDICATOR_RSI_PERIOD,
+          emaFastPeriod: INDICATOR_EMA_FAST_PERIOD,
+          emaSlowPeriod: INDICATOR_EMA_SLOW_PERIOD,
+          macdFastPeriod: INDICATOR_MACD_FAST_PERIOD,
+          macdSlowPeriod: INDICATOR_MACD_SLOW_PERIOD,
+          macdSignalPeriod: INDICATOR_MACD_SIGNAL_PERIOD,
+          p1RsiMin: P1_RSI_MIN,
+          p1RsiMax: P1_RSI_MAX,
+          p1AllowPriceAboveFastEma: P1_ALLOW_PRICE_ABOVE_FAST_EMA,
+          p1MinMacdHistogram: P1_MIN_MACD_HISTOGRAM,
+          p3RsiMin: P3_RSI_MIN,
+          p3RsiMax: P3_RSI_MAX,
+          p3RequireTrendUp: P3_REQUIRE_TREND_UP,
+          p3RequirePriceAboveFastEma: P3_REQUIRE_PRICE_ABOVE_FAST_EMA,
+          p3MinMacdHistogram: P3_MIN_MACD_HISTOGRAM,
+          sellRsiOverboughtThreshold: SELL_RSI_OVERBOUGHT_THRESHOLD,
+          sellRsiBreakdownThreshold: SELL_RSI_BREAKDOWN_THRESHOLD,
+          sellRequireMacdWeakening: SELL_REQUIRE_MACD_WEAKENING,
+        },
+        macdHistogram: indicators.macdHistogram,
+        trendUp: indicators.trendUp,
+        priceAboveFastEma: indicators.priceAboveFastEma,
+        p1IndicatorOk,
+        p3IndicatorOk,
       },
       p1: {
         youngEnough: youngEnoughForP1,
@@ -1002,6 +1229,7 @@ function entryExecutionGuard(summary) {
  */
 function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const prices = coin?.history || [];
+  const indicators = analyzeIndicators(prices);
   const pnlPct = openPosition.buyPrice > 0
     ? ((currentPrice - openPosition.buyPrice) / openPosition.buyPrice) * 100
     : 0;
@@ -1070,12 +1298,27 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
     // At +12% or more: exit on softer signals (deceleration + any drop)
     if (decelerating) return { sell: true, reason: 'momentum-deceleration' };
     if (threeDrops && negativeFlow) return { sell: true, reason: 'trend-reversal' };
+    if (indicators.dataReady
+      && indicators.rsi >= SELL_RSI_OVERBOUGHT_THRESHOLD
+      && (!SELL_REQUIRE_MACD_WEAKENING || indicators.macdWeakening)
+    ) {
+      return { sell: true, reason: 'rsi-overbought-macd-rollover' };
+    }
   }
 
   if (pnlPct >= 25) {
     // At +25%: lock in gains at any two-candle drop
     const twoDrops = last3[2] < last3[1] && last3[1] < last3[0];
     if (twoDrops) return { sell: true, reason: 'locking-gains-above-25pct' };
+  }
+
+  if (indicators.dataReady && pnlPct >= strategyState.minProfitExitPct) {
+    // Low RSI + bearish momentum while still in profit means trend has likely exhausted.
+    if (indicators.rsi <= SELL_RSI_BREAKDOWN_THRESHOLD
+      && (!SELL_REQUIRE_MACD_WEAKENING || indicators.macdWeakening)
+    ) {
+      return { sell: true, reason: 'rsi-breakdown-in-profit' };
+    }
   }
 
   return { sell: false, reason: 'momentum-ok' };

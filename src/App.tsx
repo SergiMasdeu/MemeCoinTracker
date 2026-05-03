@@ -254,7 +254,6 @@ function App() {
   }
 
   useEffect(() => {
-    fetchDashboard()
     const dashId = setInterval(fetchDashboard, 1000) // full state every 1s
     return () => {
       clearInterval(dashId)
@@ -320,25 +319,20 @@ function App() {
   const trackedTotalPages = Math.max(1, Math.ceil((data?.tracked.length ?? 0) / pageSize))
   const skippedTotalPages = Math.max(1, Math.ceil((data?.skipped.length ?? 0) / pageSize))
 
-  useEffect(() => {
-    if (trackedPage > trackedTotalPages) setTrackedPage(trackedTotalPages)
-  }, [trackedPage, trackedTotalPages])
-
-  useEffect(() => {
-    if (skippedPage > skippedTotalPages) setSkippedPage(skippedTotalPages)
-  }, [skippedPage, skippedTotalPages])
+  const currentTrackedPage = Math.min(trackedPage, trackedTotalPages)
+  const currentSkippedPage = Math.min(skippedPage, skippedTotalPages)
 
   const pagedTracked = useMemo(() => {
     const source = data?.tracked ?? []
-    const start = (trackedPage - 1) * pageSize
+    const start = (currentTrackedPage - 1) * pageSize
     return source.slice(start, start + pageSize)
-  }, [data?.tracked, trackedPage])
+  }, [data?.tracked, currentTrackedPage])
 
   const pagedSkipped = useMemo(() => {
     const source = data?.skipped ?? []
-    const start = (skippedPage - 1) * pageSize
+    const start = (currentSkippedPage - 1) * pageSize
     return source.slice(start, start + pageSize)
-  }, [data?.skipped, skippedPage])
+  }, [data?.skipped, currentSkippedPage])
 
   const statusTone = data?.bot.running ? 'status-live' : 'status-offline'
   const checkClass = (value: boolean) => (value ? 'check-pass' : 'check-fail')
@@ -778,15 +772,15 @@ function App() {
               <button
                 type="button"
                 onClick={() => setTrackedPage((p) => Math.max(1, p - 1))}
-                disabled={trackedPage <= 1}
+                disabled={currentTrackedPage <= 1}
               >
                 Prev
               </button>
-              <span className="muted">Page {trackedPage} / {trackedTotalPages}</span>
+              <span className="muted">Page {currentTrackedPage} / {trackedTotalPages}</span>
               <button
                 type="button"
                 onClick={() => setTrackedPage((p) => Math.min(trackedTotalPages, p + 1))}
-                disabled={trackedPage >= trackedTotalPages}
+                disabled={currentTrackedPage >= trackedTotalPages}
               >
                 Next
               </button>
@@ -836,15 +830,15 @@ function App() {
               <button
                 type="button"
                 onClick={() => setSkippedPage((p) => Math.max(1, p - 1))}
-                disabled={skippedPage <= 1}
+                disabled={currentSkippedPage <= 1}
               >
                 Prev
               </button>
-              <span className="muted">Page {skippedPage} / {skippedTotalPages}</span>
+              <span className="muted">Page {currentSkippedPage} / {skippedTotalPages}</span>
               <button
                 type="button"
                 onClick={() => setSkippedPage((p) => Math.min(skippedTotalPages, p + 1))}
-                disabled={skippedPage >= skippedTotalPages}
+                disabled={currentSkippedPage >= skippedTotalPages}
               >
                 Next
               </button>

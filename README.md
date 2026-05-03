@@ -53,6 +53,44 @@ It now includes:
 - `USE_REAL_DATA` (default `true`; set `false` to force simulation)
 - `BOT_INTERVAL_MS` (default `7000`)
 
+Indicator tuning (entry and exits):
+
+- `INDICATOR_RSI_PERIOD` (default `14`)
+- `INDICATOR_EMA_FAST_PERIOD` (default `9`)
+- `INDICATOR_EMA_SLOW_PERIOD` (default `21`)
+- `INDICATOR_MACD_FAST_PERIOD` (default `12`)
+- `INDICATOR_MACD_SLOW_PERIOD` (default `26`)
+- `INDICATOR_MACD_SIGNAL_PERIOD` (default `9`)
+
+Phase 1 entry thresholds:
+
+- `P1_RSI_MIN` (default `48`)
+- `P1_RSI_MAX` (default `78`)
+- `P1_ALLOW_PRICE_ABOVE_FAST_EMA` (default `true`)
+- `P1_MIN_MACD_HISTOGRAM` (default `-0.00000001`)
+
+Phase 3 breakout entry thresholds:
+
+- `P3_RSI_MIN` (default `50`)
+- `P3_RSI_MAX` (default `72`)
+- `P3_REQUIRE_TREND_UP` (default `true`)
+- `P3_REQUIRE_PRICE_ABOVE_FAST_EMA` (default `true`)
+- `P3_MIN_MACD_HISTOGRAM` (default `0`)
+
+Indicator-based exit thresholds:
+
+- `SELL_RSI_OVERBOUGHT_THRESHOLD` (default `75`)
+- `SELL_RSI_BREAKDOWN_THRESHOLD` (default `44`)
+- `SELL_REQUIRE_MACD_WEAKENING` (default `true`)
+
+Phase detection tuning (stabilization sensitivity):
+
+- `P3_MIN_DRAWDOWN_FROM_ATH` (default `0.20`)
+- `P3_MAX_RECENT_RANGE` (default `0.22`)
+- `P3_MAX_ABS_RECENT_SLOPE` (default `0.08`)
+- `P3_MAX_SINGLE_TICK_DROP_PCT` (default `6`)
+- `P2_MAX_FLAT_SLOPE_FOR_CRASH` (default `-0.015`)
+
 ## Run
 
 ```bash
