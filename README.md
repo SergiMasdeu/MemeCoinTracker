@@ -79,6 +79,7 @@ Phase 3 breakout entry thresholds:
 
 Indicator-based exit thresholds:
 
+- `QUICK_PROFIT_PCT` (default `5`, immediate sell when open position profit is >= this value)
 - `SELL_RSI_OVERBOUGHT_THRESHOLD` (default `75`)
 - `SELL_RSI_BREAKDOWN_THRESHOLD` (default `44`)
 - `SELL_REQUIRE_MACD_WEAKENING` (default `true`)

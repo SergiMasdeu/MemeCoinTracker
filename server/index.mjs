@@ -79,6 +79,8 @@ const DEFAULT_TRAIL_ACTIVATE_PCT = Number(process.env.TRAIL_ACTIVATE_PCT || 10);
 const DEFAULT_TRAIL_STOP_PCT = Number(process.env.TRAIL_STOP_PCT || 8);
 // Profit-only selling policy (can be disabled by setting PROFIT_ONLY_MODE=false)
 const DEFAULT_PROFIT_ONLY_MODE = process.env.PROFIT_ONLY_MODE !== 'false';
+// Sell immediately as soon as open position PnL reaches this level.
+const DEFAULT_QUICK_PROFIT_PCT = Number(process.env.QUICK_PROFIT_PCT || 5);
 // Require at least this unrealized gain before normal profit exits can trigger
 const DEFAULT_MIN_PROFIT_EXIT_PCT = Number(process.env.MIN_PROFIT_EXIT_PCT || 1.5);
 // Always lock gains at this profit, regardless of momentum
@@ -163,7 +165,7 @@ const botState = {
 const strategyPresets = {
   conservative: {
     minProfitExitPct: 3,
-    quickProfitPct: 5,
+    quickProfitPct: DEFAULT_QUICK_PROFIT_PCT,
     hardTakeProfitPct: 26,
     breakevenArmPct: 8,
     breakevenFloorPct: 2,
@@ -174,7 +176,7 @@ const strategyPresets = {
   },
   balanced: {
     minProfitExitPct: DEFAULT_MIN_PROFIT_EXIT_PCT,
-    quickProfitPct: 5,
+    quickProfitPct: DEFAULT_QUICK_PROFIT_PCT,
     hardTakeProfitPct: DEFAULT_HARD_TAKE_PROFIT_PCT,
     breakevenArmPct: DEFAULT_BREAKEVEN_ARM_PCT,
     breakevenFloorPct: DEFAULT_BREAKEVEN_FLOOR_PCT,
@@ -185,7 +187,7 @@ const strategyPresets = {
   },
   aggressive: {
     minProfitExitPct: 1,
-    quickProfitPct: 5,
+    quickProfitPct: DEFAULT_QUICK_PROFIT_PCT,
     hardTakeProfitPct: 16,
     breakevenArmPct: 5,
     breakevenFloorPct: 1,
@@ -199,7 +201,7 @@ const strategyPresets = {
 const strategyState = {
   preset: 'balanced',
   profitOnlyMode: DEFAULT_PROFIT_ONLY_MODE,
-  quickProfitPct: 5,
+  quickProfitPct: DEFAULT_QUICK_PROFIT_PCT,
   ...strategyPresets.balanced,
 };
 
@@ -207,6 +209,7 @@ function getStrategySnapshot() {
   return {
     preset: strategyState.preset,
     profitOnlyMode: strategyState.profitOnlyMode,
+    quickProfitPct: strategyState.quickProfitPct,
     minProfitExitPct: strategyState.minProfitExitPct,
     hardTakeProfitPct: strategyState.hardTakeProfitPct,
     breakevenArmPct: strategyState.breakevenArmPct,
