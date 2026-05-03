@@ -312,8 +312,24 @@ function App() {
 
   const topCandidates = useMemo(() => {
     if (!data) return []
-    return data.market.filter((coin) => coin.canBuy).slice(0, 8)
-  }, [data])
+    const trackedCandidates = (data.tracked ?? [])
+      .map((item) => item.snapshot)
+      .filter((coin) => coin.canBuy)
+
+    const seenAddresses = new Set(trackedCandidates.map((coin) => coin.address))
+    const marketFallback = (data.market ?? []).filter(
+      (coin) => coin.canBuy && !seenAddresses.has(coin.address),
+    )
+
+    return [...trackedCandidates, ...marketFallback]
+      .sort((a, b) => {
+        if (b.phaseConfidence !== a.phaseConfidence) {
+          return b.phaseConfidence - a.phaseConfidence
+        }
+        return b.marketCap - a.marketCap
+      })
+      .slice(0, 8)
+  }, [data?.tracked, data?.market])
 
   const pageSize = 20
   const trackedTotalPages = Math.max(1, Math.ceil((data?.tracked.length ?? 0) / pageSize))
