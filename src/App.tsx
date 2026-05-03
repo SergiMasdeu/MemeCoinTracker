@@ -240,7 +240,7 @@ function App() {
   // Full dashboard: all state every 1s
   async function fetchDashboard() {
     try {
-      const res = await fetch('/api/dashboard')
+      const res = await fetch('/api/dashboard', { cache: 'no-store' })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = (await res.json()) as DashboardData
       setData(json)

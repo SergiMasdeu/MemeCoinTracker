@@ -1975,27 +1975,40 @@ async function scanAndTrack() {
 }
 
 function getDashboard() {
-  const activeTradingViewSignals = listActiveTradingViewSignals(20);
-  const tracked = [...trackedCoins.entries()]
-    .map(([symbol, value]) => ({
-      symbol,
-      status: value.status,
-      observedAt: value.observedAt,
-      lastSeenAt: value.lastSeenAt,
-      position: value.position,
-      snapshot: value.snapshot,
-    }))
-    .filter((item) => item.snapshot)
-    .sort((a, b) => b.snapshot.marketCap - a.snapshot.marketCap);
+  // Ensure open position marks reflect the freshest known market prices.
+  updateOpenPositionMarks();
 
-  const skipped = [...skippedCoins.values()]
-    .filter((item) => item.snapshot)
-    .sort((a, b) => b.skippedAt - a.skippedAt);
+  const activeTradingViewSignals = listActiveTradingViewSignals(20);
 
   const market = [...marketState.values()]
     .map((coin) => summarizeCoin(coin))
     .sort((a, b) => b.marketCap - a.marketCap)
     .slice(0, 40);
+
+  const summaryBySymbol = new Map(market.map((item) => [item.symbol, item]));
+
+  const tracked = [...trackedCoins.entries()]
+    .map(([symbol, value]) => {
+      const refreshedSnapshot = summaryBySymbol.get(symbol) || value.snapshot;
+      return {
+        symbol,
+        status: value.status,
+        observedAt: value.observedAt,
+        lastSeenAt: value.lastSeenAt,
+        position: value.position,
+        snapshot: refreshedSnapshot,
+      };
+    })
+    .filter((item) => item.snapshot)
+    .sort((a, b) => b.snapshot.marketCap - a.snapshot.marketCap);
+
+  const skipped = [...skippedCoins.values()]
+    .map((item) => ({
+      ...item,
+      snapshot: summaryBySymbol.get(item.symbol) || item.snapshot,
+    }))
+    .filter((item) => item.snapshot)
+    .sort((a, b) => b.skippedAt - a.skippedAt);
 
   return {
     bot: {
