@@ -48,7 +48,7 @@ const MAX_ENTRY_DRAWDOWN_PCT = Number(process.env.MAX_ENTRY_DRAWDOWN_PCT || 18);
 const MIN_ENTRY_M5_PCT = Number(process.env.MIN_ENTRY_M5_PCT || -1.8);
 const MIN_ENTRY_H1_PCT = Number(process.env.MIN_ENTRY_H1_PCT || -4);
 const MIN_ENTRY_BUY_SELL_RATIO = Number(process.env.MIN_ENTRY_BUY_SELL_RATIO || 1.03);
-const MIN_ENTRY_LIQUIDITY_USD = Number(process.env.MIN_ENTRY_LIQUIDITY_USD || 40_000);
+const MIN_ENTRY_LIQUIDITY_USD = Number(process.env.MIN_ENTRY_LIQUIDITY_USD || 10_000);
 const MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ = Number(process.env.MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ || 1.6);
 const MIN_ENTRY_ACTIVE_USERS_NO_LIQ = Number(process.env.MIN_ENTRY_ACTIVE_USERS_NO_LIQ || 22);
 const MIN_VOL_LIQ_RATIO = Number(process.env.MIN_VOL_LIQ_RATIO || 0.35);
@@ -64,12 +64,12 @@ const P2_MAX_FLAT_SLOPE_FOR_CRASH = Number(process.env.P2_MAX_FLAT_SLOPE_FOR_CRA
 const SKIP_RECHECK_MS = Number(process.env.SKIP_RECHECK_MS || 3 * 60 * 1000);
 // Entry execution safety: avoid buying into immediate reversals and cut instant dumps.
 const ENTRY_GUARD_WINDOW_POINTS = Number(process.env.ENTRY_GUARD_WINDOW_POINTS || 6);
-const ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT || 7.5);
-const ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT = Number(process.env.ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT || 3.2);
-const ENTRY_GUARD_MIN_LAST2_COMBINED_PCT = Number(process.env.ENTRY_GUARD_MIN_LAST2_COMBINED_PCT || -2.6);
+const ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT || 15);
+const ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT = Number(process.env.ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT || 6);
+const ENTRY_GUARD_MIN_LAST2_COMBINED_PCT = Number(process.env.ENTRY_GUARD_MIN_LAST2_COMBINED_PCT || -5);
 const ENTRY_GUARD_MIN_BUY_SELL_RATIO = Number(process.env.ENTRY_GUARD_MIN_BUY_SELL_RATIO || 1.2);
 const ENTRY_GUARD_MAX_WINDOW_RISE_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_RISE_PCT || 24);
-const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 2);
+const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 1);
 const POST_BUY_PROTECTION_MS = Number(process.env.POST_BUY_PROTECTION_MS || 90_000);
 const POST_BUY_EMERGENCY_STOP_PCT = Number(process.env.POST_BUY_EMERGENCY_STOP_PCT || -4.5);
 const ALLOW_EMERGENCY_LOSS_EXIT = process.env.ALLOW_EMERGENCY_LOSS_EXIT === 'true';
@@ -1445,8 +1445,10 @@ function maybeExitPosition(summary, state) {
 
 function isSkipCoolingDown(skipState, now = Date.now()) {
   if (!skipState) return false;
-  const lastSeenAt = Number(skipState.lastSeenAt || skipState.skippedAt || 0);
-  return now - lastSeenAt < SKIP_RECHECK_MS;
+  // Use skippedAt (fixed point in time) — not lastSeenAt which resets every scan
+  // and would make the cooldown effectively infinite.
+  const skippedAt = Number(skipState.skippedAt || 0);
+  return now - skippedAt < SKIP_RECHECK_MS;
 }
 
 function seedCoin(symbol, name, basePrice, pumpPrice, settlePrice) {
@@ -1602,6 +1604,8 @@ function safeNumber(value, fallback = 0) {
 function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct, pair }) {
   const price = safeNumber(pair?.priceUsd, 0);
   if (price <= 0) return false;
+  // Skipped coins are frozen — do not append new price ticks or update their market data.
+  if (skippedCoins.has(symbol)) return false;
 
   const txnsH24 = pair?.txns?.h24 || {};
   const buys = safeNumber(txnsH24?.buys, 0);
@@ -1791,7 +1795,10 @@ function ingestSimulatedData() {
   }
 
   for (const coin of marketState.values()) {
-    mutateSimCoin(coin);
+    // Skip mutating coins that are currently in the skipped list — keep their data frozen.
+    if (!skippedCoins.has(coin.symbol)) {
+      mutateSimCoin(coin);
+    }
   }
 }
 
@@ -1931,14 +1938,10 @@ async function scanAndTrack() {
       if (skippedCoins.has(summary.symbol)) {
         const previousSkip = skippedCoins.get(summary.symbol);
         if (summary.canBuy || !isSkipCoolingDown(previousSkip, now)) {
+          // Cooldown expired or coin now qualifies — remove from skip list and re-evaluate.
           skippedCoins.delete(summary.symbol);
         } else {
-          skippedCoins.set(summary.symbol, {
-            ...previousSkip,
-            reason: summary.skipReason || previousSkip.reason,
-            lastSeenAt: now,
-            snapshot: summary,
-          });
+          // Still cooling down — keep snapshot frozen, do not update price or lastSeenAt.
           continue;
         }
       }
@@ -1964,14 +1967,10 @@ async function scanAndTrack() {
 
           const guard = entryExecutionGuard(summary);
           if (!guard.ok) {
-            const previousSkip = skippedCoins.get(summary.symbol);
-            skippedCoins.set(summary.symbol, {
-              symbol: summary.symbol,
-              reason: guard.reason,
-              skippedAt: previousSkip?.skippedAt ?? now,
-              lastSeenAt: now,
-              snapshot: summary,
-            });
+            // Reset streak so it must re-confirm next scan, but do NOT put into
+            // skippedCoins — the 3-min cooldown there would prevent any buy at all
+            // for fast-moving P1 coins.
+            existing.buySignalStreak = 0;
             existing.status = 'watching';
             trackedCoins.set(summary.symbol, existing);
             continue;
@@ -2041,11 +2040,8 @@ function getDashboard() {
     .filter((item) => item.snapshot)
     .sort((a, b) => b.snapshot.marketCap - a.snapshot.marketCap);
 
+  // Skipped coin snapshots are intentionally frozen — do not refresh from live market data.
   const skipped = [...skippedCoins.values()]
-    .map((item) => ({
-      ...item,
-      snapshot: summaryBySymbol.get(item.symbol) || item.snapshot,
-    }))
     .filter((item) => item.snapshot)
     .sort((a, b) => b.skippedAt - a.skippedAt);
 
