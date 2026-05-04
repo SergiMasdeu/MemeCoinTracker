@@ -52,6 +52,7 @@ It now includes:
 - `STARTING_BALANCE_USD` (default `10000`)
 - `USE_REAL_DATA` (default `true`; set `false` to force simulation)
 - `BOT_INTERVAL_MS` (default `7000`)
+- `MAX_OPEN_POSITIONS` (default `unlimited`; set to a positive number to cap concurrent positions)
 
 Indicator tuning (entry and exits):
 
@@ -90,6 +91,17 @@ Indicator-based exit thresholds:
 - `SELL_RSI_OVERBOUGHT_THRESHOLD` (default `75`)
 - `SELL_RSI_BREAKDOWN_THRESHOLD` (default `44`)
 - `SELL_REQUIRE_MACD_WEAKENING` (default `true`)
+
+Conservative loss-management exits:
+
+- `CONSERVATIVE_LOSS_EXIT_ENABLED` (default `true`)
+- `CONSERVATIVE_LOSS_MIN_HOLD_MS` (default `720000`)
+- `CONSERVATIVE_LOSS_ARM_PCT` (default `-10`)
+- `CONSERVATIVE_LOSS_MAX_PCT` (default `-35`)
+- `CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO` (default `0.78`)
+- `CONSERVATIVE_LOSS_RSI_MAX` (default `34`)
+- `CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT` (default `7.5`)
+- `CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS` (default `3`)
 
 Phase detection tuning (stabilization sensitivity):
 

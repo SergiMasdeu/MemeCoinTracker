@@ -27,8 +27,11 @@ const STARTING_BALANCE_USD = Number(process.env.STARTING_BALANCE_USD || 10_000);
 const MIN_HOLD_MS = Number(process.env.MIN_HOLD_MS || 120_000);
 // Require at least this many price points before considering any buy
 const MIN_HISTORY_DEPTH = Number(process.env.MIN_HISTORY_DEPTH || 6);
-// Maximum concurrent open positions
-const MAX_OPEN_POSITIONS = Number(process.env.MAX_OPEN_POSITIONS || 3);
+// Maximum concurrent open positions.
+// Default is unlimited; set MAX_OPEN_POSITIONS to a positive number to cap slots.
+const MAX_OPEN_POSITIONS = process.env.MAX_OPEN_POSITIONS === undefined
+  ? Number.POSITIVE_INFINITY
+  : Number(process.env.MAX_OPEN_POSITIONS);
 // Coin must be younger than this for a P1 buy (3 hours)
 const MAX_COIN_AGE_P1_MS = Number(process.env.MAX_COIN_AGE_P1_MS || 3 * 60 * 60 * 1000);
 // Only buy when phase confidence is at or above this threshold
@@ -86,6 +89,15 @@ const NEW_DISCOVERY_MIN_M5_PCT = Number(process.env.NEW_DISCOVERY_MIN_M5_PCT || 
 const POST_BUY_PROTECTION_MS = Number(process.env.POST_BUY_PROTECTION_MS || 90_000);
 const POST_BUY_EMERGENCY_STOP_PCT = Number(process.env.POST_BUY_EMERGENCY_STOP_PCT || -4.5);
 const ALLOW_EMERGENCY_LOSS_EXIT = process.env.ALLOW_EMERGENCY_LOSS_EXIT === 'true';
+// Conservative loss-management exits: only cut losing trades when multiple bearish signals agree.
+const CONSERVATIVE_LOSS_EXIT_ENABLED = envBoolean('CONSERVATIVE_LOSS_EXIT_ENABLED', true);
+const CONSERVATIVE_LOSS_MIN_HOLD_MS = Number(process.env.CONSERVATIVE_LOSS_MIN_HOLD_MS || 12 * 60 * 1000);
+const CONSERVATIVE_LOSS_ARM_PCT = Number(process.env.CONSERVATIVE_LOSS_ARM_PCT || -10);
+const CONSERVATIVE_LOSS_MAX_PCT = Number(process.env.CONSERVATIVE_LOSS_MAX_PCT || -35);
+const CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO = Number(process.env.CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO || 0.78);
+const CONSERVATIVE_LOSS_RSI_MAX = Number(process.env.CONSERVATIVE_LOSS_RSI_MAX || 34);
+const CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT = Number(process.env.CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT || 7.5);
+const CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS = Number(process.env.CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS || 3);
 // Once unrealized PnL exceeds this, activate trailing stop
 const DEFAULT_TRAIL_ACTIVATE_PCT = Number(process.env.TRAIL_ACTIVATE_PCT || 10);
 // Trail stop: close when price falls this far below the peak seen while holding
@@ -243,7 +255,18 @@ function getStrategySnapshot() {
     trailStopPct: strategyState.trailStopPct,
     profitTimeExitMs: strategyState.profitTimeExitMs,
     profitTimeExitMinPct: strategyState.profitTimeExitMinPct,
+    conservativeLossExitEnabled: CONSERVATIVE_LOSS_EXIT_ENABLED,
+    conservativeLossMinHoldMs: CONSERVATIVE_LOSS_MIN_HOLD_MS,
+    conservativeLossArmPct: CONSERVATIVE_LOSS_ARM_PCT,
+    conservativeLossMaxPct: CONSERVATIVE_LOSS_MAX_PCT,
+    conservativeLossMinBearishSignals: CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS,
   };
+}
+
+function hasOpenPositionCapacity() {
+  if (!Number.isFinite(MAX_OPEN_POSITIONS)) return true;
+  if (MAX_OPEN_POSITIONS <= 0) return true;
+  return walletState.openPositions.size < MAX_OPEN_POSITIONS;
 }
 
 function rand(min, max) {
@@ -1329,6 +1352,44 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   if (pnlPct >= strategyState.quickProfitPct) {
     return { sell: true, reason: `quick-profit-${strategyState.quickProfitPct}pct` };
   }
+  const buySellRatio = (coin?.sellVolume || 0) > 0 ? coin.buyVolume / coin.sellVolume : 1;
+  const negativeFlow = (coin?.capitalFlow || 0) < 0;
+  const phase = prices.length >= 6 ? detectPhase(prices) : null;
+
+  // Conservative loss path: only exit losers when bearish evidence is strong.
+  if (CONSERVATIVE_LOSS_EXIT_ENABLED && pnlPct <= CONSERVATIVE_LOSS_ARM_PCT && heldMs >= CONSERVATIVE_LOSS_MIN_HOLD_MS) {
+    if (pnlPct <= CONSERVATIVE_LOSS_MAX_PCT) {
+      return { sell: true, reason: `conservative-max-loss-${Math.abs(CONSERVATIVE_LOSS_MAX_PCT)}pct` };
+    }
+
+    if (prices.length < 4) {
+      return { sell: false, reason: 'conservative-loss-await-data' };
+    }
+
+    const last3 = prices.slice(-3);
+    const threeDrops = last3[2] < last3[1] && last3[1] < last3[0];
+
+    const recentPrices = prices.slice(-6);
+    const firstRecent = recentPrices[0] || currentPrice;
+    const recentDrawdownPct = firstRecent > 0
+      ? ((currentPrice - firstRecent) / firstRecent) * 100
+      : 0;
+
+    const bearishSignals = [
+      phase?.phase === PHASES.PHASE_2,
+      negativeFlow && buySellRatio <= CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO,
+      indicators.dataReady
+        && indicators.rsi <= CONSERVATIVE_LOSS_RSI_MAX
+        && (!SELL_REQUIRE_MACD_WEAKENING || indicators.macdWeakening),
+      threeDrops && recentDrawdownPct <= -Math.abs(CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT),
+    ].filter(Boolean).length;
+
+    if (bearishSignals >= CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS) {
+      return { sell: true, reason: `conservative-loss-exit-${bearishSignals}signals` };
+    }
+
+    return { sell: false, reason: `conservative-loss-not-confirmed-${bearishSignals}signals` };
+  }
 
   // Only fire normal exits above a minimum profit buffer.
   if (pnlPct < strategyState.minProfitExitPct) {
@@ -1351,9 +1412,6 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const last4 = prices.slice(-4);
   const last3 = prices.slice(-3);
 
-  const buySellRatio = coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 1;
-  const negativeFlow = coin.capitalFlow < 0;
-
   // 3 consecutive price drops — momentum has reversed
   const threeDrops = last3[2] < last3[1] && last3[1] < last3[0];
 
@@ -1366,8 +1424,7 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const decelerating = m2 < m1 * 0.4 && last4[3] < last4[2]; // move shrinking fast AND price dropping
 
   // Phase has turned bearish
-  const phase = detectPhase(prices);
-  const phaseCrashing = phase.phase === PHASES.PHASE_2;
+  const phaseCrashing = phase?.phase === PHASES.PHASE_2;
 
   // Exit logic — tiered by profit level
   if (pnlPct >= 5) {
@@ -2162,7 +2219,7 @@ async function scanAndTrack() {
           existing.buySignalStreak = summary.canBuy ? (existing.buySignalStreak || 0) + 1 : 0;
         }
 
-        if (!existing.position && summary.canBuy && walletState.openPositions.size < MAX_OPEN_POSITIONS) {
+        if (!existing.position && summary.canBuy && hasOpenPositionCapacity()) {
           if ((existing.buySignalStreak || 0) < Math.max(1, BUY_CONFIRMATION_SCANS)) {
             existing.status = 'watching';
             trackedCoins.set(summary.symbol, existing);
@@ -2301,7 +2358,11 @@ function getDashboard() {
 async function startBot() {
   if (botState.running) return;
   botState.running = true;
-  await scanAndTrack();
+
+  await scanAndTrack().catch((error) => {
+    botState.lastDataError = error instanceof Error ? error.message : 'Unknown startup scan error';
+  });
+
   botState.timer = setInterval(() => {
     scanAndTrack().catch((error) => {
       botState.lastDataError = error instanceof Error ? error.message : 'Unknown scan error';
@@ -2508,7 +2569,9 @@ app.listen(PORT, async () => {
 
   // Always-on price refresh loop — independent of trading bot
   setInterval(() => {
-    refreshPrices();
+    refreshPrices().catch((error) => {
+      botState.lastDataError = error instanceof Error ? error.message : 'Price refresh loop error';
+    });
   }, PRICE_REFRESH_MS);
 
   console.log(`Price refresh loop started (every ${PRICE_REFRESH_MS}ms)`);
@@ -2519,4 +2582,12 @@ app.listen(PORT, async () => {
     });
     console.log(`Trading loop auto-start: ${botState.running ? 'ON' : 'FAILED'}`);
   }
+});
+
+process.on('unhandledRejection', (reason) => {
+  botState.lastDataError = reason instanceof Error ? reason.message : String(reason || 'Unhandled rejection');
+});
+
+process.on('uncaughtException', (error) => {
+  botState.lastDataError = error instanceof Error ? error.message : String(error || 'Uncaught exception');
 });
