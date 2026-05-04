@@ -630,6 +630,12 @@ function summarizeCoin(coin) {
   const noLiqFallbackOk = !hasLiquidityData
     && buySellRatio >= MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ
     && coin.activeUsers >= MIN_ENTRY_ACTIVE_USERS_NO_LIQ;
+  const isNewDiscovery = coinAgeMs <= NEW_DISCOVERY_WINDOW_MS && prices.length <= NEW_DISCOVERY_MAX_HISTORY_POINTS;
+  const newDiscoveryConservativeOk = isNewDiscovery
+    && buySellRatio >= NEW_DISCOVERY_MIN_BUY_SELL_RATIO
+    && coin.activeUsers >= NEW_DISCOVERY_MIN_ACTIVE_USERS
+    && drawdownPct <= NEW_DISCOVERY_MAX_DRAWDOWN_PCT
+    && pc.m5 >= NEW_DISCOVERY_MIN_M5_PCT;
   const entryQuality = {
     drawdownOk: drawdownPct <= MAX_ENTRY_DRAWDOWN_PCT,
     shortMomentumOk: pc.m5 >= MIN_ENTRY_M5_PCT && pc.h1 >= MIN_ENTRY_H1_PCT,
