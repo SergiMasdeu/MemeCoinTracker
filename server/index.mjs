@@ -72,6 +72,10 @@ const ENTRY_GUARD_MAX_WINDOW_RISE_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDO
 const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 1);
 // Memory guard: keep non-position tracked coins only for this long, then move to skipped.
 const TRACKED_TTL_MS = Number(process.env.TRACKED_TTL_MS || 3 * 60 * 1000);
+// Hard size caps — evict oldest entries when maps exceed these limits.
+const MAX_MARKET_STATE_SIZE = Number(process.env.MAX_MARKET_STATE_SIZE || 60);
+const MAX_TRACKED_COINS_SIZE = Number(process.env.MAX_TRACKED_COINS_SIZE || 30);
+const MAX_SKIPPED_COINS_SIZE = Number(process.env.MAX_SKIPPED_COINS_SIZE || 100);
 // New discovery path: lower strictness while keeping low-mid conservative safety checks.
 const NEW_DISCOVERY_WINDOW_MS = Number(process.env.NEW_DISCOVERY_WINDOW_MS || 90_000);
 const NEW_DISCOVERY_MAX_HISTORY_POINTS = Number(process.env.NEW_DISCOVERY_MAX_HISTORY_POINTS || 10);
@@ -1637,6 +1641,62 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+// --- Map size-cap eviction helpers ---
+
+// Evict the oldest non-position coins from marketState when over the cap.
+// Coins with an open position are always preserved.
+function evictMarketState() {
+  if (marketState.size <= MAX_MARKET_STATE_SIZE) return;
+  const openAddresses = new Set(walletState.openPositions.keys());
+  // Sort by createdAt ascending (oldest first); keep coins with open positions last.
+  const sorted = [...marketState.entries()].sort(([, a], [, b]) => {
+    const aProtected = openAddresses.has(a.address) ? 1 : 0;
+    const bProtected = openAddresses.has(b.address) ? 1 : 0;
+    if (aProtected !== bProtected) return aProtected - bProtected; // protected last
+    return (a.createdAt || 0) - (b.createdAt || 0); // oldest first
+  });
+  const evictCount = marketState.size - MAX_MARKET_STATE_SIZE;
+  for (let i = 0; i < evictCount; i++) {
+    const [addr, coin] = sorted[i];
+    if (openAddresses.has(addr)) break; // never evict open positions
+    marketState.delete(addr);
+    // Also evict from trackedCoins by symbol if not holding a position
+    const tracked = trackedCoins.get(coin.symbol);
+    if (tracked && !tracked.position) {
+      trackedCoins.delete(coin.symbol);
+    }
+  }
+}
+
+// Evict the oldest non-position entries from trackedCoins when over the cap.
+function evictTrackedCoins() {
+  if (trackedCoins.size <= MAX_TRACKED_COINS_SIZE) return;
+  const sorted = [...trackedCoins.entries()].sort(([, a], [, b]) => {
+    const aProtected = a.position ? 1 : 0;
+    const bProtected = b.position ? 1 : 0;
+    if (aProtected !== bProtected) return aProtected - bProtected;
+    return (a.observedAt || 0) - (b.observedAt || 0);
+  });
+  const evictCount = trackedCoins.size - MAX_TRACKED_COINS_SIZE;
+  for (let i = 0; i < evictCount; i++) {
+    const [symbol, state] = sorted[i];
+    if (state.position) break;
+    trackedCoins.delete(symbol);
+  }
+}
+
+// Evict the oldest entries from skippedCoins when over the cap.
+function evictSkippedCoins() {
+  if (skippedCoins.size <= MAX_SKIPPED_COINS_SIZE) return;
+  const sorted = [...skippedCoins.entries()].sort(
+    ([, a], [, b]) => (a.skippedAt || 0) - (b.skippedAt || 0),
+  );
+  const evictCount = skippedCoins.size - MAX_SKIPPED_COINS_SIZE;
+  for (let i = 0; i < evictCount; i++) {
+    skippedCoins.delete(sorted[i][0]);
+  }
+}
+
 function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct, pair }) {
   const price = safeNumber(pair?.priceUsd, 0);
   if (price <= 0) return false;
@@ -1684,6 +1744,7 @@ function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct,
     source: 'real',
   });
 
+  evictMarketState();
   return true;
 }
 
@@ -2162,6 +2223,10 @@ async function scanAndTrack() {
         trackedCoins.delete(symbol);
       }
     }
+
+    // Hard size-cap eviction — runs after TTL cleanup so caps are always honoured.
+    evictTrackedCoins();
+    evictSkippedCoins();
 
     updateOpenPositionMarks();
     updateRealizedPnlPct();
