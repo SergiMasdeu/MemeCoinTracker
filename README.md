@@ -1,21 +1,19 @@
 # Pump.Gun Memecoin Tracker + Bot
 
-React dashboard + Node bot engine that scans memecoins and classifies each coin in 4 phases.
+React dashboard + Node bot engine that scans memecoins and ranks each coin with Option A score analysis.
 
 It now includes:
 
 - Real market data mode (Pump.fun discovery + DexScreener market metrics)
 - Virtual paper wallet starting at $10,000
 
-- Phase 1: first pump
-- Phase 2: first crash
-- Phase 3: stabilization
-- Phase 4: second pump
+- Option A composite scoring: momentum + flow + liquidity + risk + catalyst
+- Conservative risk controls for entries and exits
 
 ## Trading rule implemented
 
-- Bot tracks coins while they are in Phase 1 or Phase 2.
-- Bot buys only when Phase 3 is confirmed and a Phase 4 trend signal is detected.
+- Bot tracks coins when Option A score passes watch thresholds.
+- Bot buys only when Option A entry score and quality floors are all satisfied.
 - Bot tracks total buy volume and total sell volume.
 - After a profitable sell, that coin is blacklisted and never tracked again in this runtime.
 
@@ -31,7 +29,7 @@ It now includes:
 ## Project structure
 
 - `src/*`: React dashboard
-- `server/index.mjs`: scanning bot, phase logic, social scoring, API
+- `server/index.mjs`: scanning bot, Option A score logic, social scoring, API
 
 ## API endpoints
 
@@ -63,27 +61,20 @@ Indicator tuning (entry and exits):
 - `INDICATOR_MACD_SLOW_PERIOD` (default `26`)
 - `INDICATOR_MACD_SIGNAL_PERIOD` (default `9`)
 
-Phase 1 entry thresholds:
+Option A entry thresholds:
 
-- `P1_RSI_MIN` (default `48`)
-- `P1_RSI_MAX` (default `78`)
-- `P1_ALLOW_PRICE_ABOVE_FAST_EMA` (default `true`)
-- `P1_MIN_MACD_HISTOGRAM` (default `-0.00000001`)
-- `P1_EARLY_INDICATOR_OVERRIDE_ENABLED` (default `true`)
-- `P1_EARLY_MAX_HISTORY_POINTS` (default `6`)
-- `P1_EARLY_MIN_BUY_SELL_RATIO` (default `1.45`)
-- `P1_EARLY_MIN_ACTIVE_USERS` (default `20`)
-- `P1_EARLY_RSI_MIN` (default `52`)
-- `P1_EARLY_RSI_MAX` (default `76`)
-- `P1_EARLY_MIN_MACD_HISTOGRAM` (default `0`)
+- `OPTION_A_MIN_ENTRY_SCORE` (default `0.68`)
+- `OPTION_A_TRACK_MIN_SCORE` (default `0.44`)
+- `OPTION_A_MIN_MOMENTUM_SCORE` (default `0.52`)
+- `OPTION_A_MIN_FLOW_SCORE` (default `0.58`)
+- `OPTION_A_MIN_RISK_SCORE` (default `0.50`)
+- `OPTION_A_TV_SCORE_BONUS` (default `0.05`)
+- `OPTION_A_MAX_COIN_AGE_MS` (default `28800000`)
 
-Phase 3 breakout entry thresholds:
+Option A exit breakdown guards:
 
-- `P3_RSI_MIN` (default `50`)
-- `P3_RSI_MAX` (default `72`)
-- `P3_REQUIRE_TREND_UP` (default `true`)
-- `P3_REQUIRE_PRICE_ABOVE_FAST_EMA` (default `true`)
-- `P3_MIN_MACD_HISTOGRAM` (default `0`)
+- `OPTION_A_EXIT_MOMENTUM_FLOOR` (default `0.36`)
+- `OPTION_A_EXIT_RISK_FLOOR` (default `0.38`)
 
 Indicator-based exit thresholds:
 
@@ -103,13 +94,7 @@ Conservative loss-management exits:
 - `CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT` (default `7.5`)
 - `CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS` (default `3`)
 
-Phase detection tuning (stabilization sensitivity):
-
-- `P3_MIN_DRAWDOWN_FROM_ATH` (default `0.20`)
-- `P3_MAX_RECENT_RANGE` (default `0.22`)
-- `P3_MAX_ABS_RECENT_SLOPE` (default `0.08`)
-- `P3_MAX_SINGLE_TICK_DROP_PCT` (default `6`)
-- `P2_MAX_FLAT_SLOPE_FOR_CRASH` (default `-0.015`)
+Legacy phase-tuning variables are no longer used for entry decisions.
 
 ## Run
 

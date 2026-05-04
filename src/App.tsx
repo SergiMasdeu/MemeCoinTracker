@@ -1,12 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
-type Phase =
-  | 'PHASE_1_FIRST_PUMP'
-  | 'PHASE_2_FIRST_CRASH'
-  | 'PHASE_3_STABILIZATION'
-  | 'PHASE_4_SECOND_PUMP'
-
 type SocialCheck = {
   hasTwitter: boolean
   hasTelegram: boolean
@@ -21,10 +15,6 @@ type CoinSnapshot = {
   name: string
   address: string
   priceSeries: number[]
-  phase: Phase
-  phaseLabel: string
-  phaseConfidence: number
-  phaseReason: string
   price: number
   marketCap: number
   liquidityUsd: number
@@ -34,42 +24,26 @@ type CoinSnapshot = {
   sellVolume: number
   creatorOwnershipPct: number
   social: SocialCheck
-  phase4Signal: {
-    value: boolean
-    reason: string
-    buySellRatio: number
-    checks?: {
-      ascending: boolean
-      positiveFlow: boolean
-      healthyUsers: boolean
+  analysis: {
+    mode: 'OPTION_A'
+    entryScore: number
+    momentumScore: number
+    flowScore: number
+    liquidityScore: number
+    riskScore: number
+    catalystScore: number
+    entryQualified: boolean
+    scoreThreshold: number
+    scoreThresholdApplied: number
+    tvBoost: boolean
+    trend: {
+      bearish: boolean
+      recentDrawdownPct: number
+      recentSlopePct: number
     }
-    thresholds?: {
-      minBuySellRatio: number
-      minActiveUsers: number
-    }
-  }
-  phase1Signal: {
-    value: boolean
-    reason: string
-    buySellRatio: number
-    checks?: {
-      flowAcceptable: boolean
-      buyPressure: boolean
-      highActivity: boolean
-      notOverbought: boolean
-      rising: boolean
-      hasVelocity: boolean
-    }
-    thresholds?: {
-      minBuySellRatio: number
-      minVelocityPct: number
-      minActiveUsers: number
-      maxCreatorOwnershipPct: number
-    }
-    lastMovePct?: number
   }
   buyChecks: {
-    path: 'P1' | 'P3_BREAKOUT' | null
+    path: 'OPTION_A' | null
     common: {
       marketCapOk: boolean
       marketCap: number
@@ -84,21 +58,10 @@ type CoinSnapshot = {
       tradingViewPattern?: string | null
       tradingViewTimeframe?: string | null
       tradingViewSignalAt?: number | null
-    }
-    p1: {
-      youngEnough: boolean
-      coinAgeMs: number
+      minMomentumScore: number
+      minFlowScore: number
+      minRiskScore: number
       maxCoinAgeMs: number
-      signal: CoinSnapshot['phase1Signal']
-    }
-    p3: {
-      signal: CoinSnapshot['phase4Signal']
-      hasEnoughHistory: boolean
-      historyPoints: number
-      minHistoryDepth: number
-      confidence: number
-      minConfidence: number
-      confidenceOk: boolean
     }
   }
   canBuy: boolean
@@ -323,8 +286,8 @@ function App() {
 
     return [...trackedCandidates, ...marketFallback]
       .sort((a, b) => {
-        if (b.phaseConfidence !== a.phaseConfidence) {
-          return b.phaseConfidence - a.phaseConfidence
+        if (b.analysis.entryScore !== a.analysis.entryScore) {
+          return b.analysis.entryScore - a.analysis.entryScore
         }
         return b.marketCap - a.marketCap
       })
@@ -362,10 +325,9 @@ function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">pump.gun TA bot</p>
-          <h1>Memecoin Phase Tracker</h1>
+          <h1>Memecoin Score Trader</h1>
           <p className="subtitle">
-            Tracks first pump/crash/stabilization/second pump and only buys when Phase 3 shows a
-            valid Phase 4 signal.
+            Option A strategy: buys only when momentum, flow, liquidity and risk scores align.
           </p>
           <p className="subtitle">Data Source: {data?.bot.dataSource ?? '-'}</p>
           {data?.bot.lastDataError ? (
@@ -546,17 +508,15 @@ function App() {
       </section>
 
       <section className="panel">
-        <h2>Buy Candidates (Phase 1 / Phase 3→4 Signal)</h2>
+        <h2>Buy Candidates (Option A Score)</h2>
         <div className="chips">
           {topCandidates.length === 0 ? <span className="muted">No valid candidates yet.</span> : null}
           {topCandidates.map((coin) => {
             const ageMin = Math.round((coin.coinAgeMs ?? 0) / 60000)
             return (
               <span key={coin.symbol} className="chip">
-                {coin.symbol} | {coin.buyReason} | ratio{' '}
-                {coin.buyReason === 'P1 Early Pump'
-                  ? coin.phase1Signal.buySellRatio
-                  : coin.phase4Signal.buySellRatio}{' '}
+                {coin.symbol} | score {coin.analysis.entryScore.toFixed(2)} | mom {coin.analysis.momentumScore.toFixed(2)}
+                | flow {coin.analysis.flowScore.toFixed(2)} | risk {coin.analysis.riskScore.toFixed(2)}
                 | social {coin.social.verdict} | age {ageMin}m
               </span>
             )
@@ -637,12 +597,8 @@ function App() {
         {topCandidates.length === 0 ? <p className="muted">No active buy candidates right now.</p> : null}
         <div className="why-grid">
           {topCandidates.map((coin) => {
-            const isP1 = coin.buyChecks.path === 'P1'
-            const ageMin = Math.round((coin.buyChecks.p1.coinAgeMs ?? 0) / 60000)
-            const maxAgeMin = Math.round((coin.buyChecks.p1.maxCoinAgeMs ?? 0) / 60000)
-            const p1Signal = coin.buyChecks.p1.signal
-            const p3Signal = coin.buyChecks.p3.signal
-
+            const maxAgeMin = Math.round((coin.buyChecks.common.maxCoinAgeMs ?? 0) / 60000)
+            const ageMin = Math.round((coin.coinAgeMs ?? 0) / 60000)
             return (
               <article key={`${coin.symbol}-why`} className="why-card">
                 <h3>
@@ -655,38 +611,21 @@ function App() {
                   Social {coin.buyChecks.common.socialVerdict}
                   {!coin.buyChecks.common.hasSocialData ? ' (no social data required)' : ''}
                 </p>
-
-                {isP1 ? (
-                  <>
-                    <p className={`check-line ${checkClass(Boolean(p1Signal.value))}`}>
-                      P1 signal: {p1Signal.reason} | ratio {p1Signal.buySellRatio}
-                    </p>
-                    <p className={`check-line ${checkClass(coin.buyChecks.p1.youngEnough)}`}>
-                      Coin age {ageMin}m {'<='} {maxAgeMin}m
-                    </p>
-                    <p className={`check-line ${checkClass(Boolean(p1Signal.checks?.highActivity))}`}>
-                      Active users {coin.activeUsers} {'>='} {p1Signal.thresholds?.minActiveUsers ?? 20}
-                    </p>
-                    <p className={`check-line ${checkClass(Boolean(p1Signal.checks?.hasVelocity))}`}>
-                      Last move {p1Signal.lastMovePct ?? 0}% {'>='} {p1Signal.thresholds?.minVelocityPct ?? 0.5}%
-                    </p>
-                  </>
-                ) : (
-                  <>
-                    <p className={`check-line ${checkClass(Boolean(p3Signal.value))}`}>
-                      P3-{'>'}P4 signal: {p3Signal.reason} | ratio {p3Signal.buySellRatio}
-                    </p>
-                    <p className={`check-line ${checkClass(coin.buyChecks.p3.hasEnoughHistory)}`}>
-                      History {coin.buyChecks.p3.historyPoints} {'>='} {coin.buyChecks.p3.minHistoryDepth} points
-                    </p>
-                    <p className={`check-line ${checkClass(coin.buyChecks.p3.confidenceOk)}`}>
-                      Confidence {Math.round(coin.buyChecks.p3.confidence * 100)}% {'>='} {Math.round(coin.buyChecks.p3.minConfidence * 100)}%
-                    </p>
-                    <p className={`check-line ${checkClass(Boolean(p3Signal.checks?.healthyUsers))}`}>
-                      Active users {coin.activeUsers} {'>='} {p3Signal.thresholds?.minActiveUsers ?? 25}
-                    </p>
-                  </>
-                )}
+                <p className={`check-line ${checkClass(coin.analysis.entryScore >= coin.analysis.scoreThresholdApplied)}`}>
+                  Entry score {coin.analysis.entryScore.toFixed(2)} {'>='} {coin.analysis.scoreThresholdApplied.toFixed(2)}
+                </p>
+                <p className={`check-line ${checkClass(coin.analysis.momentumScore >= coin.buyChecks.common.minMomentumScore)}`}>
+                  Momentum {coin.analysis.momentumScore.toFixed(2)} {'>='} {coin.buyChecks.common.minMomentumScore.toFixed(2)}
+                </p>
+                <p className={`check-line ${checkClass(coin.analysis.flowScore >= coin.buyChecks.common.minFlowScore)}`}>
+                  Flow {coin.analysis.flowScore.toFixed(2)} {'>='} {coin.buyChecks.common.minFlowScore.toFixed(2)}
+                </p>
+                <p className={`check-line ${checkClass(coin.analysis.riskScore >= coin.buyChecks.common.minRiskScore)}`}>
+                  Risk quality {coin.analysis.riskScore.toFixed(2)} {'>='} {coin.buyChecks.common.minRiskScore.toFixed(2)}
+                </p>
+                <p className={`check-line ${checkClass(ageMin <= maxAgeMin)}`}>
+                  Coin age {ageMin}m {'<='} {maxAgeMin}m
+                </p>
               </article>
             )
           })}
@@ -721,7 +660,7 @@ function App() {
                 <thead>
                   <tr>
                     <th>Coin</th>
-                    <th>Phase</th>
+                    <th>Score</th>
                     <th>Graph</th>
                     <th>Cap Flow</th>
                     <th>MCap</th>
@@ -746,10 +685,10 @@ function App() {
                         ) : null}
                       </td>
                       <td>
-                        <span className={`phase ${phaseClass(item.snapshot.phase)}`}>
-                          {phaseShort(item.snapshot.phase)}
-                        </span>
-                        <p className="muted">{Math.round(item.snapshot.phaseConfidence * 100)}%</p>
+                        <strong>{item.snapshot.analysis.entryScore.toFixed(2)}</strong>
+                        <p className="muted">
+                          M {item.snapshot.analysis.momentumScore.toFixed(2)} | F {item.snapshot.analysis.flowScore.toFixed(2)} | R {item.snapshot.analysis.riskScore.toFixed(2)}
+                        </p>
                       </td>
                       <td>
                         <Sparkline points={item.snapshot.priceSeries} className="sparkline-tracked" />
@@ -809,7 +748,7 @@ function App() {
                 <thead>
                   <tr>
                     <th>Coin</th>
-                    <th>Phase</th>
+                    <th>Score</th>
                     <th>MCap</th>
                     <th>Skip Reason</th>
                     <th>Skipped At</th>
@@ -823,10 +762,10 @@ function App() {
                         <p className="muted">{item.snapshot.name}</p>
                       </td>
                       <td>
-                        <span className={`phase ${phaseClass(item.snapshot.phase)}`}>
-                          {phaseShort(item.snapshot.phase)}
-                        </span>
-                        <p className="muted">{Math.round(item.snapshot.phaseConfidence * 100)}%</p>
+                        <strong>{item.snapshot.analysis.entryScore.toFixed(2)}</strong>
+                        <p className="muted">
+                          M {item.snapshot.analysis.momentumScore.toFixed(2)} | F {item.snapshot.analysis.flowScore.toFixed(2)} | R {item.snapshot.analysis.riskScore.toFixed(2)}
+                        </p>
                       </td>
                       <td>${fmt(item.snapshot.marketCap)}</td>
                       <td className="muted">{item.reason}</td>
@@ -902,20 +841,6 @@ function App() {
 function fmt(value: number | undefined) {
   if (typeof value !== 'number') return '0'
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value)
-}
-
-function phaseShort(phase: Phase) {
-  if (phase === 'PHASE_1_FIRST_PUMP') return 'P1 Pump'
-  if (phase === 'PHASE_2_FIRST_CRASH') return 'P2 Crash'
-  if (phase === 'PHASE_3_STABILIZATION') return 'P3 Base'
-  return 'P4 Pump'
-}
-
-function phaseClass(phase: Phase) {
-  if (phase === 'PHASE_1_FIRST_PUMP') return 'p1'
-  if (phase === 'PHASE_2_FIRST_CRASH') return 'p2'
-  if (phase === 'PHASE_3_STABILIZATION') return 'p3'
-  return 'p4'
 }
 
 function Sparkline({ points, className }: { points: number[]; className?: string }) {

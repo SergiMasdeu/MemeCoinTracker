@@ -34,8 +34,16 @@ const MAX_OPEN_POSITIONS = process.env.MAX_OPEN_POSITIONS === undefined
   : Number(process.env.MAX_OPEN_POSITIONS);
 // Coin must be younger than this for a P1 buy (3 hours)
 const MAX_COIN_AGE_P1_MS = Number(process.env.MAX_COIN_AGE_P1_MS || 3 * 60 * 60 * 1000);
-// Only buy when phase confidence is at or above this threshold
-const MIN_PHASE_CONFIDENCE = Number(process.env.MIN_PHASE_CONFIDENCE || 0.65);
+// Option A (score-based): entry requires a minimum composite score and quality floors.
+const OPTION_A_MIN_ENTRY_SCORE = Number(process.env.OPTION_A_MIN_ENTRY_SCORE || 0.68);
+const OPTION_A_TRACK_MIN_SCORE = Number(process.env.OPTION_A_TRACK_MIN_SCORE || 0.44);
+const OPTION_A_MIN_MOMENTUM_SCORE = Number(process.env.OPTION_A_MIN_MOMENTUM_SCORE || 0.52);
+const OPTION_A_MIN_FLOW_SCORE = Number(process.env.OPTION_A_MIN_FLOW_SCORE || 0.58);
+const OPTION_A_MIN_RISK_SCORE = Number(process.env.OPTION_A_MIN_RISK_SCORE || 0.50);
+const OPTION_A_TV_SCORE_BONUS = Number(process.env.OPTION_A_TV_SCORE_BONUS || 0.05);
+const OPTION_A_MAX_COIN_AGE_MS = Number(process.env.OPTION_A_MAX_COIN_AGE_MS || 8 * 60 * 60 * 1000);
+const OPTION_A_EXIT_MOMENTUM_FLOOR = Number(process.env.OPTION_A_EXIT_MOMENTUM_FLOOR || 0.36);
+const OPTION_A_EXIT_RISK_FLOOR = Number(process.env.OPTION_A_EXIT_RISK_FLOOR || 0.38);
 // Market cap ceiling — skip large caps that can't meaningfully move
 const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 10_000_000);
 // Keep mature high-value coins (up to 24h old) in tracking even if not buy-eligible.
@@ -57,12 +65,7 @@ const MIN_ENTRY_ACTIVE_USERS_NO_LIQ = Number(process.env.MIN_ENTRY_ACTIVE_USERS_
 const MIN_VOL_LIQ_RATIO = Number(process.env.MIN_VOL_LIQ_RATIO || 0.35);
 const MAX_VOL_LIQ_RATIO = Number(process.env.MAX_VOL_LIQ_RATIO || 30);
 const MIN_CANDLE_BULLISH_SCORE = Number(process.env.MIN_CANDLE_BULLISH_SCORE || 0.55);
-// Phase classification tuning (helps detect P3 stabilization before broad crash buckets)
-const P3_MIN_DRAWDOWN_FROM_ATH = Number(process.env.P3_MIN_DRAWDOWN_FROM_ATH || 0.20);
-const P3_MAX_RECENT_RANGE = Number(process.env.P3_MAX_RECENT_RANGE || 0.22);
-const P3_MAX_ABS_RECENT_SLOPE = Number(process.env.P3_MAX_ABS_RECENT_SLOPE || 0.08);
-const P3_MAX_SINGLE_TICK_DROP_PCT = Number(process.env.P3_MAX_SINGLE_TICK_DROP_PCT || 6);
-const P2_MAX_FLAT_SLOPE_FOR_CRASH = Number(process.env.P2_MAX_FLAT_SLOPE_FOR_CRASH || -0.015);
+// Legacy phase tuning kept for backwards compatibility in env files (phase logic removed from strategy).
 // Recheck skipped symbols after cooldown instead of suppressing forever.
 const SKIP_RECHECK_MS = Number(process.env.SKIP_RECHECK_MS || 3 * 60 * 1000);
 // Entry execution safety: avoid buying into immediate reversals and cut instant dumps.
@@ -152,20 +155,6 @@ app.use(express.json());
 if (HAS_CLIENT_BUILD) {
   app.use(express.static(CLIENT_DIST_DIR));
 }
-
-const PHASES = {
-  PHASE_1: 'PHASE_1_FIRST_PUMP',
-  PHASE_2: 'PHASE_2_FIRST_CRASH',
-  PHASE_3: 'PHASE_3_STABILIZATION',
-  PHASE_4: 'PHASE_4_SECOND_PUMP',
-};
-
-const phaseLabel = {
-  [PHASES.PHASE_1]: 'Phase 1 - First Pump',
-  [PHASES.PHASE_2]: 'Phase 2 - First Crash',
-  [PHASES.PHASE_3]: 'Phase 3 - Stabilization',
-  [PHASES.PHASE_4]: 'Phase 4 - Second Pump',
-};
 
 const marketState = new Map();
 const trackedCoins = new Map();
@@ -277,145 +266,37 @@ function floatRand(min, max) {
   return Math.random() * (max - min) + min;
 }
 
-function detectPhase(prices) {
-  if (prices.length < 6) {
-    return { phase: PHASES.PHASE_1, confidence: 0.52, reason: 'Insufficient history — defaults to pump' };
-  }
+function clamp01(value) {
+  return Math.max(0, Math.min(1, value));
+}
 
-  const n = prices.length;
-  const latest = prices[n - 1];
-  const first = prices[0];
-
-  const maxPrice = Math.max(...prices);
-  const maxIndex = prices.indexOf(maxPrice);
-
-  // ---- Key shape metrics ----
-
-  // Where (0–1) in the series did the ATH occur? 1.0 = at the very end (still pumping)
-  const peakPosition = n > 1 ? maxIndex / (n - 1) : 1;
-
-  // How large was the initial pump from series-start to ATH?
-  const pumpMagnitude = first > 0 ? (maxPrice - first) / first : 0;
-
-  // How far is current price below ATH?
-  const drawdownFromATH = maxPrice > 0 ? (maxPrice - latest) / maxPrice : 0;
-
-  // ---- Recent window (last ~25% of series, min 4 ticks) ----
-  const recentCount = Math.max(4, Math.ceil(n * 0.25));
-  const recentWindow = prices.slice(-recentCount);
-  const recentFirst = recentWindow[0];
-  const recentLast = recentWindow[recentWindow.length - 1];
-  const recentMin = Math.min(...recentWindow);
-  const recentMax = Math.max(...recentWindow);
-  // % slope across recent window (positive = rising, negative = falling)
-  const recentSlope = recentFirst > 0 ? (recentLast - recentFirst) / recentFirst : 0;
-  // How compressed is the recent price range? (low = flat/stabilising)
-  const recentRange = recentMin > 0 ? (recentMax - recentMin) / recentMin : 0;
-
-  const recentDeltasPct = [];
-  for (let i = 1; i < recentWindow.length; i += 1) {
-    const prev = recentWindow[i - 1];
-    const next = recentWindow[i];
-    recentDeltasPct.push(prev > 0 ? ((next - prev) / prev) * 100 : 0);
-  }
-  const positiveTicks = recentDeltasPct.filter((v) => v > 0).length;
-  const negativeTicks = recentDeltasPct.filter((v) => v < 0).length;
-  const maxSingleDropPct = recentDeltasPct.length > 0 ? Math.min(...recentDeltasPct) : 0;
-  const stableOscillation = positiveTicks > 0 && negativeTicks > 0;
-  const noHardRecentDump = maxSingleDropPct >= -P3_MAX_SINGLE_TICK_DROP_PCT;
-
-  // ---- Post-peak rebound from crash low ----
-  const postPeakPrices = prices.slice(maxIndex);
-  const postPeakMin = postPeakPrices.length > 0 ? Math.min(...postPeakPrices) : latest;
-  const rebound = postPeakMin > 0 ? (latest - postPeakMin) / postPeakMin : 0;
-
-  // ================================================================
-  // P1 — BIG PUMP
-  // Graph shape: sharp rise, ATH is at or very near the END of the
-  // series (price still climbing or just topped), minimal drawdown.
-  // ================================================================
-  if (peakPosition >= 0.72 && latest >= maxPrice * 0.85) {
-    const conf = Math.min(0.92, 0.60 + peakPosition * 0.30 + Math.min(0.10, pumpMagnitude * 0.05));
+function getTrendBreakdown(prices) {
+  if (!Array.isArray(prices) || prices.length < 4) {
     return {
-      phase: PHASES.PHASE_1, confidence: conf,
-      reason: `Peak at ${(peakPosition * 100).toFixed(0)}% mark — still in pump territory`,
+      bearish: false,
+      threeDrops: false,
+      recentDrawdownPct: 0,
+      recentSlopePct: 0,
     };
   }
 
-  if (drawdownFromATH < 0.15 && pumpMagnitude >= 0.15 && recentSlope >= 0) {
-    return {
-      phase: PHASES.PHASE_1, confidence: 0.75,
-      reason: `Only -${(drawdownFromATH * 100).toFixed(1)}% from ATH, uptrend intact`,
-    };
-  }
+  const recent = prices.slice(-6);
+  const first = recent[0];
+  const last = recent[recent.length - 1];
+  const peak = Math.max(...recent);
+  const recentDrawdownPct = peak > 0 ? ((peak - last) / peak) * 100 : 0;
+  const recentSlopePct = first > 0 ? ((last - first) / first) * 100 : 0;
 
-  // ================================================================
-  // P3 — STABILISATION
-  // Graph shape: big crash has happened, but recent prices are FLAT
-  // and compressed — the coin is finding a floor (tight coil).
-  // ================================================================
-  if (
-    drawdownFromATH >= P3_MIN_DRAWDOWN_FROM_ATH
-    && recentRange <= P3_MAX_RECENT_RANGE
-    && Math.abs(recentSlope) <= P3_MAX_ABS_RECENT_SLOPE
-    && noHardRecentDump
-    && (stableOscillation || Math.abs(recentSlope) <= 0.02)
-  ) {
-    const conf = Math.min(0.92, 0.64 + (P3_MAX_RECENT_RANGE - recentRange) * 1.8 + Math.min(0.12, drawdownFromATH * 0.25));
-    return {
-      phase: PHASES.PHASE_3, confidence: conf,
-      reason: `Base forming: range ${(recentRange * 100).toFixed(1)}%, slope ${(recentSlope * 100).toFixed(1)}%, drawdown -${(drawdownFromATH * 100).toFixed(0)}%`,
-    };
-  }
+  const last3 = prices.slice(-3);
+  const threeDrops = last3[2] < last3[1] && last3[1] < last3[0];
+  const bearish = threeDrops || (recentDrawdownPct >= 7 && recentSlopePct <= -5);
 
-  // ================================================================
-  // P2 — CRASH
-  // Graph shape: ATH was EARLY in the series, price has since dropped
-  // sharply, and recent ticks are still meaningfully down.
-  // ================================================================
-  if (peakPosition < 0.55 && drawdownFromATH >= 0.25 && recentSlope <= P2_MAX_FLAT_SLOPE_FOR_CRASH && rebound < 0.18) {
-    const conf = Math.min(0.90, 0.60 + drawdownFromATH * 0.50);
-    return {
-      phase: PHASES.PHASE_2, confidence: conf,
-      reason: `Crash -${(drawdownFromATH * 100).toFixed(0)}% from peak (at ${(peakPosition * 100).toFixed(0)}% mark), still falling`,
-    };
-  }
-
-  // Heavy sell-off regardless of peak position
-  if (drawdownFromATH >= 0.35 && recentSlope <= -0.05 && rebound < 0.15) {
-    return {
-      phase: PHASES.PHASE_2, confidence: 0.80,
-      reason: `Heavy sell-off: -${(drawdownFromATH * 100).toFixed(0)}% drawdown, recent slope ${(recentSlope * 100).toFixed(1)}%`,
-    };
-  }
-
-  // ================================================================
-  // P4 — SECOND PUMP (breakout from base)
-  // Graph shape: ATH was early, crash happened (P2), flat floor (P3),
-  // now price BREAKS UP with positive recent slope AND meaningful
-  // rebound from the crash low.
-  // ================================================================
-  if (drawdownFromATH >= 0.20 && recentSlope >= 0.05 && rebound >= 0.20) {
-    const conf = Math.min(0.92, 0.60 + Math.min(0.20, rebound * 0.40) + Math.min(0.12, recentSlope * 0.60));
-    return {
-      phase: PHASES.PHASE_4, confidence: conf,
-      reason: `Breakout: +${(recentSlope * 100).toFixed(1)}% recent slope, +${(rebound * 100).toFixed(0)}% off crash low`,
-    };
-  }
-
-  // Softer P4: slower grind-up after deep crash
-  if (drawdownFromATH >= 0.30 && recentSlope > 0.02 && rebound >= 0.35) {
-    return {
-      phase: PHASES.PHASE_4, confidence: 0.72,
-      reason: `Grind recovery: +${(rebound * 100).toFixed(0)}% off crash low, positive recent slope`,
-    };
-  }
-
-  // ---- Fallbacks ----
-  if (drawdownFromATH < 0.25) {
-    return { phase: PHASES.PHASE_1, confidence: 0.55, reason: 'Near ATH — possible early pump' };
-  }
-  return { phase: PHASES.PHASE_2, confidence: 0.55, reason: 'Bearish structure — unclassified' };
+  return {
+    bearish,
+    threeDrops,
+    recentDrawdownPct,
+    recentSlopePct,
+  };
 }
 
 function analyzeCandlestick(prices) {
@@ -628,137 +509,6 @@ function analyzeIndicators(prices) {
   };
 }
 
-function phase4Signal(coin) {
-  const prices = coin.history;
-  const minBuySellRatio = 1.05;
-  const minActiveUsers = 15;
-  const pc = coin.priceChange;
-  if (prices.length < 5) {
-    return {
-      value: false,
-      reason: 'not-enough-data',
-      buySellRatio: 0,
-      minBuySellRatio,
-      checks: {
-        ascending: false,
-        positiveFlow: false,
-        healthyUsers: false,
-      },
-      thresholds: {
-        minBuySellRatio,
-        minActiveUsers,
-      },
-    };
-  }
-
-  const last3 = prices.slice(-3);
-  const ascending = last3[0] < last3[1] && last3[1] < last3[2];
-  const buySellRatio = coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 0;
-  const positiveFlow = coin.capitalFlow > 0;
-  const healthyUsers = coin.activeUsers >= minActiveUsers;
-  const shortMomentumOk = !pc || (pc.m5 >= -1.2 && pc.h1 >= 0);
-
-  const value = ascending && buySellRatio > minBuySellRatio && positiveFlow && healthyUsers && shortMomentumOk;
-  return {
-    value,
-    reason: value ? 'ascending-structure-with-positive-flow' : 'signal-not-strong-enough',
-    buySellRatio: Number(buySellRatio.toFixed(2)),
-    minBuySellRatio,
-    checks: {
-      ascending,
-      positiveFlow,
-      healthyUsers,
-      shortMomentumOk,
-    },
-    thresholds: {
-      minBuySellRatio,
-      minActiveUsers,
-    },
-  };
-}
-
-function phase1BuySignal(coin) {
-  const prices = coin.history;
-  // Need at least 2 data points to confirm upward movement
-  const minBuySellRatio = 1.0;
-  const minVelocityPct = 0.1;  // tick-based fallback threshold
-  const minH1Pct = 1;          // h1 price change threshold when DexScreener data available
-  const maxCreatorOwnershipPct = 35;
-  const minActiveUsers = 8;
-  if (prices.length < 2) {
-    return {
-      value: false,
-      reason: 'not-enough-data',
-      buySellRatio: 0,
-      checks: {
-        flowAcceptable: false,
-        buyPressure: false,
-        highActivity: false,
-        notOverbought: false,
-        rising: false,
-        hasVelocity: false,
-      },
-      thresholds: {
-        minBuySellRatio,
-        minVelocityPct,
-        minActiveUsers,
-        maxCreatorOwnershipPct,
-      },
-      lastMovePct: 0,
-    };
-  }
-
-  const buySellRatio = coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 0;
-  // Flow can be noisy in short windows; real h24 volumes are large so use ratio as primary gate.
-  const flowAcceptable = coin.capitalFlow > 0 || buySellRatio >= 1.2;
-  const buyPressure = buySellRatio > minBuySellRatio;            // Buyers clearly leading
-  const highActivity = coin.activeUsers >= minActiveUsers;       // Coin has real users
-  const notOverbought = coin.creatorOwnershipPct < maxCreatorOwnershipPct; // Creator not hoarding
-
-  // Prefer DexScreener hourly price change (much more reliable than 7s tick diffs).
-  // Fall back to tick-based analysis for simulated / pump.fun coins.
-  const pc = coin.priceChange;
-  const shortMomentumOk = !pc || (pc.m5 >= -1.2 && pc.h1 >= 0);
-  let rising, lastMovePct;
-  if (pc && (pc.h1 !== 0 || pc.h6 !== 0 || pc.h24 !== 0)) {
-    // Real token: use h1 change as momentum proxy
-    rising = pc.h1 >= minH1Pct;
-    lastMovePct = pc.h1;
-  } else {
-    // Simulated / brand-new coin: use tick history
-    const last3 = prices.slice(-3);
-    rising = prices.length >= 3
-      ? last3[1] > last3[0] && last3[2] > last3[1]
-      : prices[prices.length - 1] > prices[0];
-    const last2 = prices.slice(-2);
-    lastMovePct = last2[0] > 0 ? ((last2[1] - last2[0]) / last2[0]) * 100 : 0;
-  }
-  const hasVelocity = lastMovePct > (pc && pc.h1 !== 0 ? minH1Pct - 0.01 : minVelocityPct);
-
-  const value = rising && hasVelocity && buyPressure && flowAcceptable && highActivity && notOverbought;
-  return {
-    value,
-    reason: value ? 'early-pump-with-strong-buy-pressure' : 'p1-signal-not-confirmed',
-    buySellRatio: Number(buySellRatio.toFixed(2)),
-    checks: {
-      flowAcceptable,
-      buyPressure,
-      highActivity,
-      notOverbought,
-      rising,
-      hasVelocity,
-      shortMomentumOk,
-    },
-    thresholds: {
-      minBuySellRatio,
-      minVelocityPct,
-      minActiveUsers,
-      maxCreatorOwnershipPct,
-    },
-    lastMovePct: Number(lastMovePct.toFixed(2)),
-  };
-}
-
 function socialScore(coin) {
   const hasTwitter = Boolean(coin.socials.twitter);
   const hasTelegram = Boolean(coin.socials.telegram);
@@ -858,16 +608,12 @@ function listActiveTradingViewSignals(limit = 25) {
 function summarizeCoin(coin) {
   const prices = coin.history;
   const lastPrice = prices[prices.length - 1] || 0;
-  const phase = detectPhase(prices);
   const social = socialScore(coin);
-  const phase4 = phase4Signal(coin);
-  const phase1 = phase1BuySignal(coin);
   const candlestick = analyzeCandlestick(prices);
   const indicators = analyzeIndicators(prices);
   const tvSignal = TRADINGVIEW_ENABLED ? getTradingViewSignal(coin) : null;
   const tvBullish = tvSignal?.direction === 'bullish';
   const tvScoreOk = (tvSignal?.score || 0) >= TRADINGVIEW_MIN_BULLISH_SCORE;
-  // Mid-risk behavior: TradingView patterns help pass a strict gate, but do not override core market checks.
   const tvBoost = tvBullish && tvScoreOk;
 
   const coinAgeMs = Date.now() - (coin.createdAt || 0);
@@ -880,6 +626,7 @@ function summarizeCoin(coin) {
   const drawdownPct = recentPeak > 0 ? ((recentPeak - lastPrice) / recentPeak) * 100 : 0;
   const buySellRatio = coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 0;
   const pc = coin.priceChange || { m5: 0, h1: 0 };
+  const trend = getTrendBreakdown(prices);
   const noLiqFallbackOk = !hasLiquidityData
     && buySellRatio >= MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ
     && coin.activeUsers >= MIN_ENTRY_ACTIVE_USERS_NO_LIQ;
@@ -891,34 +638,8 @@ function summarizeCoin(coin) {
     volumeLiqOk: hasLiquidityData ? (volLiqRatio >= MIN_VOL_LIQ_RATIO && volLiqRatio <= MAX_VOL_LIQ_RATIO) : true,
     candlestickOk: candlestick.bullish,
   };
-  const p1CandlestickOk = candlestick.bullish || candlestick.pattern === 'insufficient-data';
-  const p1IndicatorOk = !indicators.dataReady
-    || (
-      (indicators.rsi >= P1_RSI_MIN && indicators.rsi <= P1_RSI_MAX)
-      && (indicators.trendUp || (P1_ALLOW_PRICE_ABOVE_FAST_EMA && indicators.priceAboveFastEma))
-      && (indicators.macdBullish || indicators.macdHistogram >= P1_MIN_MACD_HISTOGRAM)
-    );
-  const p3IndicatorOk = !indicators.dataReady
-    || (
-      (indicators.rsi >= P3_RSI_MIN && indicators.rsi <= P3_RSI_MAX)
-      && (!P3_REQUIRE_TREND_UP || indicators.trendUp)
-      && (!P3_REQUIRE_PRICE_ABOVE_FAST_EMA || indicators.priceAboveFastEma)
-      && indicators.macdHistogram >= P3_MIN_MACD_HISTOGRAM
-    );
-  const p1EntryQualityOk = entryQuality.drawdownOk
-    && entryQuality.flowOk
-    && entryQuality.liquidityOk
-    && p1CandlestickOk
-    && p1IndicatorOk;
-  const p3EntryQualityOk = entryQuality.drawdownOk
-    && entryQuality.shortMomentumOk
-    && entryQuality.flowOk
-    && entryQuality.liquidityOk
-    && entryQuality.volumeLiqOk
-    && entryQuality.candlestickOk
-    && p3IndicatorOk;
-  const hasEnoughHistory = prices.length >= MIN_HISTORY_DEPTH; // used only for P3
-  const confidenceOk = phase.confidence >= MIN_PHASE_CONFIDENCE; // used only for P3
+
+  const hasEnoughHistory = prices.length >= Math.max(4, MIN_HISTORY_DEPTH);
   const marketCapOk = coin.marketCap >= 0 && coin.marketCap <= MAX_MARKETCAP_USD; // allow zero mcap on fresh coins
   const highValueTrackEligible =
     coinAgeMs <= TRACK_HIGH_VALUE_MAX_AGE_MS
@@ -929,77 +650,68 @@ function summarizeCoin(coin) {
   const hasSocialData = Boolean(coin.socials?.twitter || coin.socials?.telegram || coin.socials?.website);
   const socialOk = !hasSocialData || social.verdict === 'STRONG' || social.verdict === 'MEDIUM';
 
-  // P1: fresh coin only (< 3h). No confidence gate — P1 targets brand-new coins with short history
-  // by design. The phase1BuySignal already validates momentum.
-  const youngEnoughForP1 = coinAgeMs <= MAX_COIN_AGE_P1_MS;
-  const p1EarlyIndicatorOverride = P1_EARLY_INDICATOR_OVERRIDE_ENABLED
-    && phase.phase === PHASES.PHASE_1
-    && youngEnoughForP1
-    && marketCapOk
+  const momentumScore = clamp01((
+    (clamp01((pc.m5 + 6) / 12) * 0.3)
+    + (clamp01((pc.h1 + 8) / 16) * 0.3)
+    + (clamp01((trend.recentSlopePct + 8) / 16) * 0.25)
+    + (indicators.dataReady ? clamp01(((indicators.rsi ?? 50) - 35) / 35) * 0.15 : 0.08)
+  ));
+
+  const flowScore = clamp01((
+    clamp01((buySellRatio - 0.8) / 1.2) * 0.5
+    + clamp01((coin.capitalFlow + 5_000) / 25_000) * 0.25
+    + clamp01(coin.activeUsers / 50) * 0.25
+  ));
+
+  const liquidityScore = clamp01((
+    (hasLiquidityData ? clamp01(liquidityUsd / Math.max(MIN_ENTRY_LIQUIDITY_USD * 3, 1)) * 0.6 : 0.2)
+    + (entryQuality.volumeLiqOk ? 0.25 : 0)
+    + (hasLiquidityData ? 0.15 : 0)
+  ));
+
+  const riskPenalty = clamp01(
+    clamp01(drawdownPct / 28) * 0.42
+    + clamp01(coin.creatorOwnershipPct / 42) * 0.23
+    + clamp01(Math.max(0, 0.9 - buySellRatio) / 0.9) * 0.2
+    + clamp01(Math.max(0, -pc.m5) / 10) * 0.15,
+  );
+  const riskScore = clamp01(1 - riskPenalty);
+  const catalystScore = clamp01((tvBoost ? 0.65 : 0) + (coin.boosts?.active > 0 ? 0.35 : 0));
+
+  const entryScoreRaw = clamp01(
+    momentumScore * 0.3
+    + flowScore * 0.25
+    + liquidityScore * 0.2
+    + riskScore * 0.15
+    + catalystScore * 0.1,
+  );
+  const entryScore = Number(entryScoreRaw.toFixed(3));
+  const scoreThresholdApplied = Math.max(0.5, OPTION_A_MIN_ENTRY_SCORE - (tvBoost ? OPTION_A_TV_SCORE_BONUS : 0));
+
+  const strategyHardGatesOk =
+    marketCapOk
     && socialOk
-    && prices.length <= P1_EARLY_MAX_HISTORY_POINTS
-    && indicators.dataReady
-    && indicators.rsi >= P1_EARLY_RSI_MIN
-    && indicators.rsi <= P1_EARLY_RSI_MAX
-    && indicators.trendUp
-    && indicators.priceAboveFastEma
-    && indicators.macdHistogram >= P1_EARLY_MIN_MACD_HISTOGRAM
-    && buySellRatio >= P1_EARLY_MIN_BUY_SELL_RATIO
-    && coin.activeUsers >= P1_EARLY_MIN_ACTIVE_USERS
-    && coin.capitalFlow > 0
-    && entryQuality.drawdownOk
+    && entryQuality.liquidityOk
+    && entryQuality.flowOk
     && entryQuality.shortMomentumOk
-    && entryQuality.liquidityOk
-    && entryQuality.volumeLiqOk;
-  const isNewDiscovery = coinAgeMs <= NEW_DISCOVERY_WINDOW_MS && prices.length <= NEW_DISCOVERY_MAX_HISTORY_POINTS;
-  const newDiscoveryConservativeOk = isNewDiscovery
-    && phase.phase === PHASES.PHASE_1
-    && youngEnoughForP1
-    && marketCapOk
-    && socialOk
-    && entryQuality.liquidityOk
-    && drawdownPct <= Math.min(MAX_ENTRY_DRAWDOWN_PCT, NEW_DISCOVERY_MAX_DRAWDOWN_PCT)
-    && pc.m5 >= NEW_DISCOVERY_MIN_M5_PCT
-    && buySellRatio >= NEW_DISCOVERY_MIN_BUY_SELL_RATIO
-    && coin.activeUsers >= NEW_DISCOVERY_MIN_ACTIVE_USERS
-    && coin.capitalFlow >= 0
-    && coin.creatorOwnershipPct < 24;
-  const p1CoreOk = phase.phase === PHASES.PHASE_1 && phase1.value && marketCapOk && youngEnoughForP1;
-  const canBuyP1 = (
-    phase.phase === PHASES.PHASE_1
-    && phase1.value
-    && marketCapOk
-    && youngEnoughForP1
-    && p1EntryQualityOk
-  ) || p1EarlyIndicatorOverride || newDiscoveryConservativeOk;
-  const canBuyP1Tv = p1CoreOk && tvBoost && p1EntryQualityOk;
+    && hasEnoughHistory
+    && coinAgeMs <= OPTION_A_MAX_COIN_AGE_MS;
 
-  // P3→P4: needs long history + high confidence since phase-3 detection is nuanced
-  const minP3Confidence = Math.max(MIN_PHASE_CONFIDENCE, 0.70);
-  const p3CoreOk = phase.phase === PHASES.PHASE_3 && phase4.value
-    && hasEnoughHistory && confidenceOk && marketCapOk;
-  const canBuyP3 = phase.phase === PHASES.PHASE_3 && phase4.value
-    && hasEnoughHistory && confidenceOk && phase.confidence >= minP3Confidence && marketCapOk && socialOk && p3EntryQualityOk;
-  const canBuyP3Tv = p3CoreOk && tvBoost && p3EntryQualityOk && phase.confidence >= Math.max(minP3Confidence - 0.08, 0.62);
+  const entryQualified =
+    strategyHardGatesOk
+    && entryScore >= scoreThresholdApplied
+    && momentumScore >= OPTION_A_MIN_MOMENTUM_SCORE
+    && flowScore >= OPTION_A_MIN_FLOW_SCORE
+    && riskScore >= OPTION_A_MIN_RISK_SCORE;
 
-  const canBuy = canBuyP1 || canBuyP3 || canBuyP1Tv || canBuyP3Tv;
-  const buyReason = p1EarlyIndicatorOverride
-    ? (tvBoost ? 'P1 Early Indicator Override + TV Pattern' : 'P1 Early Indicator Override')
-    : newDiscoveryConservativeOk
-    ? 'P1 New Discovery (Conservative)'
-    : canBuyP1
-    ? (tvBoost ? 'P1 Early Pump + TV Pattern' : 'P1 Early Pump')
-    : canBuyP1Tv
-      ? 'P1 TV Pattern Override'
-      : canBuyP3
-      ? (tvBoost ? 'P3→P4 Breakout + TV Pattern' : 'P3→P4 Breakout')
-      : canBuyP3Tv
-        ? 'P3→P4 TV Pattern Override'
-      : null;
+  const canBuy = entryQualified;
+  const buyReason = canBuy
+    ? `Option A score ${entryScore.toFixed(2)} >= ${scoreThresholdApplied.toFixed(2)}`
+    : null;
 
   // Surface why a coin was blocked even if signal fired
   let skipReason = null;
-  if (!canBuy && (phase1.value || phase4.value)) {
+  if (!canBuy && entryScore >= OPTION_A_TRACK_MIN_SCORE) {
     if (!marketCapOk) skipReason = coin.marketCap > MAX_MARKETCAP_USD ? `mcap $${(coin.marketCap/1e6).toFixed(1)}M > limit` : 'no mcap data';
     else if (!entryQuality.drawdownOk) skipReason = `drawdown ${drawdownPct.toFixed(1)}% > ${MAX_ENTRY_DRAWDOWN_PCT}%`;
     else if (!entryQuality.shortMomentumOk) skipReason = `weak momentum (m5 ${pc.m5.toFixed(1)}%, h1 ${pc.h1.toFixed(1)}%)`;
@@ -1010,20 +722,14 @@ function summarizeCoin(coin) {
         : `no liquidity data: need ratio >= ${MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ} and users >= ${MIN_ENTRY_ACTIVE_USERS_NO_LIQ}`;
     }
     else if (!entryQuality.volumeLiqOk) skipReason = `vol/liq ${volLiqRatio.toFixed(2)} outside ${MIN_VOL_LIQ_RATIO}-${MAX_VOL_LIQ_RATIO}`;
-    else if (!p1IndicatorOk && phase.phase === PHASES.PHASE_1) skipReason = `indicators weak for P1 (RSI ${indicators.rsi ?? 'n/a'})`;
-    else if (!p3IndicatorOk && phase.phase === PHASES.PHASE_3) skipReason = `indicators weak for P3 (RSI ${indicators.rsi ?? 'n/a'})`;
+    else if (momentumScore < OPTION_A_MIN_MOMENTUM_SCORE) skipReason = `momentum score ${momentumScore.toFixed(2)} < ${OPTION_A_MIN_MOMENTUM_SCORE}`;
+    else if (flowScore < OPTION_A_MIN_FLOW_SCORE) skipReason = `flow score ${flowScore.toFixed(2)} < ${OPTION_A_MIN_FLOW_SCORE}`;
+    else if (riskScore < OPTION_A_MIN_RISK_SCORE) skipReason = `risk score ${riskScore.toFixed(2)} < ${OPTION_A_MIN_RISK_SCORE}`;
     else if (!entryQuality.candlestickOk) skipReason = `candlestick weak (${candlestick.pattern}, score ${candlestick.score})`;
     else if (!socialOk) skipReason = `social ${social.verdict} (with data)`;
-    else if (phase.phase === PHASES.PHASE_1 && !youngEnoughForP1) skipReason = `coin too old (${Math.round(coinAgeMs/60000)}m)`;
-    else if (phase4.value && !hasEnoughHistory) skipReason = `P3 needs ${MIN_HISTORY_DEPTH} pts (have ${prices.length})`;
-    else if (phase4.value && !confidenceOk) skipReason = `P3 confidence ${phase.confidence} < ${MIN_PHASE_CONFIDENCE}`;
-  } else if (!canBuy && !phase1.value && phase.phase === PHASES.PHASE_1) {
-    // Signal didn't fire — show why
-    const bsr = coin.sellVolume > 0 ? (coin.buyVolume / coin.sellVolume) : 0;
-    if (!(coin.capitalFlow > -1500 || bsr >= 1.45)) skipReason = 'capital flow too weak';
-    else if (bsr <= 1.3) skipReason = `buy/sell ratio ${bsr.toFixed(2)} ≤ 1.3`;
-    else if (coin.activeUsers < 20) skipReason = `active users ${coin.activeUsers} < 20`;
-    else if (coin.creatorOwnershipPct >= 20) skipReason = `creator owns ${coin.creatorOwnershipPct}%`;
+    else if (!hasEnoughHistory) skipReason = `needs ${Math.max(4, MIN_HISTORY_DEPTH)} pts (have ${prices.length})`;
+    else if (coinAgeMs > OPTION_A_MAX_COIN_AGE_MS) skipReason = `coin too old (${Math.round(coinAgeMs / 60000)}m)`;
+    else if (entryScore < scoreThresholdApplied) skipReason = `entry score ${entryScore.toFixed(2)} < ${scoreThresholdApplied.toFixed(2)}`;
   }
 
   return {
@@ -1034,10 +740,6 @@ function summarizeCoin(coin) {
     priceSeries: prices.slice(-24).map((p) => Number(p.toFixed(10))),
     createdAt: coin.createdAt,
     coinAgeMs,
-    phase: phase.phase,
-    phaseLabel: phaseLabel[phase.phase],
-    phaseConfidence: phase.confidence,
-    phaseReason: phase.reason,
     price: Number(lastPrice.toFixed(10)),
     marketCap: Math.round(coin.marketCap),
     liquidityUsd: Math.round(liquidityUsd),
@@ -1048,13 +750,29 @@ function summarizeCoin(coin) {
     creatorOwnershipPct: Number(coin.creatorOwnershipPct.toFixed(2)),
     socials: coin.socials,
     social,
-    phase4Signal: phase4,
-    phase1Signal: phase1,
     candlestick,
     indicators,
+    analysis: {
+      mode: 'OPTION_A',
+      entryScore: Number(entryScore.toFixed(2)),
+      momentumScore: Number(momentumScore.toFixed(2)),
+      flowScore: Number(flowScore.toFixed(2)),
+      liquidityScore: Number(liquidityScore.toFixed(2)),
+      riskScore: Number(riskScore.toFixed(2)),
+      catalystScore: Number(catalystScore.toFixed(2)),
+      entryQualified,
+      scoreThreshold: OPTION_A_MIN_ENTRY_SCORE,
+      scoreThresholdApplied: Number(scoreThresholdApplied.toFixed(2)),
+      tvBoost,
+      trend: {
+        bearish: trend.bearish,
+        recentDrawdownPct: Number(trend.recentDrawdownPct.toFixed(2)),
+        recentSlopePct: Number(trend.recentSlopePct.toFixed(2)),
+      },
+    },
     trackHighValue24h: highValueTrackEligible,
     buyChecks: {
-      path: newDiscoveryConservativeOk ? 'P1_DISCOVERY' : canBuyP1 ? 'P1' : canBuyP3 ? 'P3_BREAKOUT' : null,
+      path: canBuy ? 'OPTION_A' : null,
       common: {
         marketCapOk,
         marketCap: Math.round(coin.marketCap),
@@ -1072,9 +790,7 @@ function summarizeCoin(coin) {
         tradingViewPattern: tvSignal?.pattern || null,
         tradingViewTimeframe: tvSignal?.timeframe || null,
         tradingViewSignalAt: tvSignal?.receivedAt || null,
-        entryQualityOk: p3EntryQualityOk,
-        p1EntryQualityOk,
-        p3EntryQualityOk,
+        entryQualityOk: strategyHardGatesOk,
         drawdownPct: Number(drawdownPct.toFixed(2)),
         maxEntryDrawdownPct: MAX_ENTRY_DRAWDOWN_PCT,
         m5Pct: Number(pc.m5.toFixed(2)),
@@ -1138,24 +854,16 @@ function summarizeCoin(coin) {
         macdHistogram: indicators.macdHistogram,
         trendUp: indicators.trendUp,
         priceAboveFastEma: indicators.priceAboveFastEma,
-        p1IndicatorOk,
-        p3IndicatorOk,
-      },
-      p1: {
-        youngEnough: youngEnoughForP1,
-        coinAgeMs,
-        maxCoinAgeMs: MAX_COIN_AGE_P1_MS,
-        highValueTrackMaxAgeMs: TRACK_HIGH_VALUE_MAX_AGE_MS,
-        signal: phase1,
-      },
-      p3: {
-        signal: phase4,
-        hasEnoughHistory,
-        historyPoints: prices.length,
-        minHistoryDepth: MIN_HISTORY_DEPTH,
-        confidence: Number(phase.confidence.toFixed(2)),
-        minConfidence: minP3Confidence,
-        confidenceOk: phase.confidence >= minP3Confidence,
+        momentumScore: Number(momentumScore.toFixed(2)),
+        flowScore: Number(flowScore.toFixed(2)),
+        liquidityScore: Number(liquidityScore.toFixed(2)),
+        riskScore: Number(riskScore.toFixed(2)),
+        entryScore: Number(entryScore.toFixed(2)),
+        minEntryScore: OPTION_A_MIN_ENTRY_SCORE,
+        minMomentumScore: OPTION_A_MIN_MOMENTUM_SCORE,
+        minFlowScore: OPTION_A_MIN_FLOW_SCORE,
+        minRiskScore: OPTION_A_MIN_RISK_SCORE,
+        maxCoinAgeMs: OPTION_A_MAX_COIN_AGE_MS,
       },
     },
     canBuy,
@@ -1354,7 +1062,7 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   }
   const buySellRatio = (coin?.sellVolume || 0) > 0 ? coin.buyVolume / coin.sellVolume : 1;
   const negativeFlow = (coin?.capitalFlow || 0) < 0;
-  const phase = prices.length >= 6 ? detectPhase(prices) : null;
+  const trend = getTrendBreakdown(prices);
 
   // Conservative loss path: only exit losers when bearish evidence is strong.
   if (CONSERVATIVE_LOSS_EXIT_ENABLED && pnlPct <= CONSERVATIVE_LOSS_ARM_PCT && heldMs >= CONSERVATIVE_LOSS_MIN_HOLD_MS) {
@@ -1376,7 +1084,7 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
       : 0;
 
     const bearishSignals = [
-      phase?.phase === PHASES.PHASE_2,
+      trend.bearish,
       negativeFlow && buySellRatio <= CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO,
       indicators.dataReady
         && indicators.rsi <= CONSERVATIVE_LOSS_RSI_MAX
@@ -1423,14 +1131,14 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const m2 = last4[2] > 0 ? Math.abs((last4[3] - last4[2]) / last4[2]) : 0;
   const decelerating = m2 < m1 * 0.4 && last4[3] < last4[2]; // move shrinking fast AND price dropping
 
-  // Phase has turned bearish
-  const phaseCrashing = phase?.phase === PHASES.PHASE_2;
+  // Trend has turned bearish
+  const trendBreaking = trend.bearish;
 
   // Exit logic — tiered by profit level
   if (pnlPct >= 5) {
     // At +5% or more: exit on any strong reversal signal
     if (threeDrops && sellersOverwhelming) return { sell: true, reason: 'momentum-reversal' };
-    if (phaseCrashing && negativeFlow) return { sell: true, reason: 'phase-crash-with-loss-of-flow' };
+    if (trendBreaking && negativeFlow) return { sell: true, reason: 'trend-breakdown-with-loss-of-flow' };
   }
 
   if (pnlPct >= 12) {
@@ -1492,11 +1200,15 @@ function maybeExitPosition(summary, state) {
   const negativeFlow = (coin?.capitalFlow || 0) < 0;
   const emergencyDump = ALLOW_EMERGENCY_LOSS_EXIT && inPostBuyProtection
     && pnlPct <= POST_BUY_EMERGENCY_STOP_PCT
-    && (negativeFlow || buySellRatio < 0.95 || summary.phase === PHASES.PHASE_2);
+    && (negativeFlow || buySellRatio < 0.95 || summary.analysis?.trend?.bearish);
 
   // Hard floor stop: only after min hold, only when trailing not yet active
   const hitStop = !strategyState.profitOnlyMode && oldEnough && !trailActive && pnlPct <= -12;
-  const bearishPhase = !strategyState.profitOnlyMode && oldEnough && summary.phase === PHASES.PHASE_2;
+  const bearishPhase = !strategyState.profitOnlyMode
+    && oldEnough
+    && summary.analysis
+    && summary.analysis.momentumScore <= OPTION_A_EXIT_MOMENTUM_FLOOR
+    && summary.analysis.riskScore <= OPTION_A_EXIT_RISK_FLOOR;
 
   if (!smartSell.sell && !hitTrail && !hitStop && !bearishPhase && !emergencyDump) return null;
 
@@ -1505,7 +1217,7 @@ function maybeExitPosition(summary, state) {
     : hitTrail ? 'trail-stop'
     : hitStop ? 'stop'
     : emergencyDump ? 'post-buy-emergency-stop'
-    : 'phase-break';
+    : 'trend-break';
 
   const proceedsUsd = openPosition.qty * summary.price;
   const pnlUsd = proceedsUsd - openPosition.investedUsd;
@@ -1586,13 +1298,12 @@ function seedCoin(symbol, name, basePrice, pumpPrice, settlePrice) {
 function mutateSimCoin(coin) {
   const prices = coin.history;
   const last = prices[prices.length - 1];
-  const phase = detectPhase(prices);
 
   let drift = floatRand(-0.04, 0.08);
-  if (phase.phase === PHASES.PHASE_1) drift = floatRand(0.01, 0.2);
-  if (phase.phase === PHASES.PHASE_2) drift = floatRand(-0.2, -0.01);
-  if (phase.phase === PHASES.PHASE_3) drift = floatRand(-0.02, 0.04);
-  if (phase.phase === PHASES.PHASE_4) drift = floatRand(0.03, 0.16);
+  const trend = getTrendBreakdown(prices);
+  if (trend.bearish) drift = floatRand(-0.2, -0.01);
+  else if (trend.recentSlopePct >= 4) drift = floatRand(0.03, 0.16);
+  else if (trend.recentSlopePct >= 0) drift = floatRand(-0.02, 0.06);
 
   const nextPrice = Math.max(last * (1 + drift), last * 0.35);
   prices.push(Number(nextPrice.toFixed(10)));
@@ -2072,14 +1783,14 @@ function checkOpenPositionExits() {
     // Emergency dump within post-buy window
     const buySellRatio = coin && coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 1;
     const negativeFlow = coin ? (coin.capitalFlow || 0) < 0 : false;
-    const phase = coin?.history ? detectPhase(coin.history) : null;
+    const trend = coin?.history ? getTrendBreakdown(coin.history) : null;
     const emergencyDump = ALLOW_EMERGENCY_LOSS_EXIT && inPostBuyProtection
       && pnlPct <= POST_BUY_EMERGENCY_STOP_PCT
-      && (negativeFlow || buySellRatio < 0.95 || phase?.phase === PHASES.PHASE_2);
+      && (negativeFlow || buySellRatio < 0.95 || trend?.bearish);
 
     // Hard floor stop
     const hitStop = !strategyState.profitOnlyMode && oldEnough && !trailActive && pnlPct <= -12;
-    const bearishPhase = !strategyState.profitOnlyMode && oldEnough && phase?.phase === PHASES.PHASE_2;
+    const bearishPhase = !strategyState.profitOnlyMode && oldEnough && trend?.bearish && negativeFlow;
 
     if (!smartSell.sell && !hitTrail && !hitStop && !bearishPhase && !emergencyDump) continue;
 
@@ -2088,7 +1799,7 @@ function checkOpenPositionExits() {
       : hitTrail ? 'trail-stop'
       : hitStop ? 'stop'
       : emergencyDump ? 'post-buy-emergency-stop'
-      : 'phase-break';
+      : 'trend-break';
 
     const proceedsUsd = position.qty * currentPrice;
     const pnlUsd = proceedsUsd - position.investedUsd;
@@ -2173,9 +1884,8 @@ async function scanAndTrack() {
       };
 
       const shouldTrackByPolicy =
-        summary.phase === PHASES.PHASE_1
-        || summary.phase === PHASES.PHASE_2
-        || summary.phase === PHASES.PHASE_3
+        summary.analysis?.entryScore >= OPTION_A_TRACK_MIN_SCORE
+        || summary.canBuy
         || trackedCoins.has(summary.symbol)
         || summary.trackHighValue24h;
 
