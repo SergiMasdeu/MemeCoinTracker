@@ -41,13 +41,20 @@ const OPTION_A_MIN_MOMENTUM_SCORE = Number(process.env.OPTION_A_MIN_MOMENTUM_SCO
 const OPTION_A_MIN_FLOW_SCORE = Number(process.env.OPTION_A_MIN_FLOW_SCORE || 0.58);
 const OPTION_A_MIN_RISK_SCORE = Number(process.env.OPTION_A_MIN_RISK_SCORE || 0.50);
 const OPTION_A_TV_SCORE_BONUS = Number(process.env.OPTION_A_TV_SCORE_BONUS || 0.05);
-const OPTION_A_MAX_COIN_AGE_MS = Number(process.env.OPTION_A_MAX_COIN_AGE_MS || 8 * 60 * 60 * 1000);
+// No default age ceiling — older coins are allowed as long as they pass score gates.
+// Set OPTION_A_MAX_COIN_AGE_MS env var to restrict (e.g. 28800000 = 8h).
+const OPTION_A_MAX_COIN_AGE_MS = process.env.OPTION_A_MAX_COIN_AGE_MS !== undefined
+  ? Number(process.env.OPTION_A_MAX_COIN_AGE_MS)
+  : Number.POSITIVE_INFINITY;
 const OPTION_A_EXIT_MOMENTUM_FLOOR = Number(process.env.OPTION_A_EXIT_MOMENTUM_FLOOR || 0.36);
 const OPTION_A_EXIT_RISK_FLOOR = Number(process.env.OPTION_A_EXIT_RISK_FLOOR || 0.38);
 // Market cap ceiling — skip large caps that can't meaningfully move
 const MAX_MARKETCAP_USD = Number(process.env.MAX_MARKETCAP_USD || 10_000_000);
-// Keep mature high-value coins (up to 24h old) in tracking even if not buy-eligible.
-const TRACK_HIGH_VALUE_MAX_AGE_MS = Number(process.env.TRACK_HIGH_VALUE_MAX_AGE_MS || 24 * 60 * 60 * 1000);
+// Keep mature coins in tracking regardless of age — no default ceiling.
+// Set TRACK_HIGH_VALUE_MAX_AGE_MS env var to cap (e.g. 86400000 = 24h).
+const TRACK_HIGH_VALUE_MAX_AGE_MS = process.env.TRACK_HIGH_VALUE_MAX_AGE_MS !== undefined
+  ? Number(process.env.TRACK_HIGH_VALUE_MAX_AGE_MS)
+  : Number.POSITIVE_INFINITY;
 const TRACK_HIGH_VALUE_MIN_MARKETCAP_USD = Number(process.env.TRACK_HIGH_VALUE_MIN_MARKETCAP_USD || 750_000);
 const TRACK_HIGH_VALUE_MIN_LIQUIDITY_USD = Number(process.env.TRACK_HIGH_VALUE_MIN_LIQUIDITY_USD || 100_000);
 const TRADINGVIEW_ENABLED = process.env.TRADINGVIEW_ENABLED !== 'false';
