@@ -149,6 +149,10 @@ const blacklist = new Set();
 const tradeLog = [];
 const tradingViewSignals = new Map();
 
+// Cache for DexScreener token-profiles (rate-limited endpoint — refresh at most every 60s)
+const DEX_PROFILES_CACHE_MS = Number(process.env.DEX_PROFILES_CACHE_MS || 60_000);
+let dexProfilesCache = { addresses: [], fetchedAt: 0 };
+
 const walletState = {
   startUsd: STARTING_BALANCE_USD,
   cashUsd: STARTING_BALANCE_USD,
@@ -1715,14 +1719,28 @@ async function ingestRealMarketDataViaPumpFun() {
 }
 
 async function ingestRealMarketDataViaDexOnly() {
-  const tokenProfiles = await fetchJson('https://api.dexscreener.com/token-profiles/latest/v1');
-  const profiles = Array.isArray(tokenProfiles) ? tokenProfiles : [];
+  const now = Date.now();
+  let solanaAddresses;
 
-  const solanaAddresses = profiles
-    .filter((item) => item?.chainId === 'solana')
-    .map((item) => item?.tokenAddress)
-    .filter((address) => typeof address === 'string' && address.length > 20)
-    .slice(0, 25);
+  if (dexProfilesCache.addresses.length > 0 && now - dexProfilesCache.fetchedAt < DEX_PROFILES_CACHE_MS) {
+    // Reuse cached addresses — avoid hammering the rate-limited profiles endpoint
+    solanaAddresses = dexProfilesCache.addresses;
+  } else {
+    const tokenProfiles = await fetchJson('https://api.dexscreener.com/token-profiles/latest/v1');
+    const profiles = Array.isArray(tokenProfiles) ? tokenProfiles : [];
+
+    solanaAddresses = profiles
+      .filter((item) => item?.chainId === 'solana')
+      .map((item) => item?.tokenAddress)
+      .filter((address) => typeof address === 'string' && address.length > 20)
+      .slice(0, 25);
+
+    if (solanaAddresses.length === 0) {
+      throw new Error('Dex token profiles contained no Solana token addresses');
+    }
+
+    dexProfilesCache = { addresses: solanaAddresses, fetchedAt: now };
+  }
 
   if (solanaAddresses.length === 0) {
     throw new Error('Dex token profiles contained no Solana token addresses');
@@ -1875,6 +1893,95 @@ async function refreshOpenPositionPrices() {
   }
 }
 
+// Check open positions for exit conditions every price refresh (1s).
+// Mirrors the logic in maybeExitPosition but runs independently of scanAndTrack.
+function checkOpenPositionExits() {
+  if (walletState.openPositions.size === 0) return;
+
+  for (const [tokenAddress, position] of [...walletState.openPositions.entries()]) {
+    const coin = marketState.get(tokenAddress);
+    const currentPrice = coin?.history?.[coin.history.length - 1] || position.currentPrice || position.buyPrice;
+    if (!currentPrice || currentPrice <= 0) continue;
+
+    const pnlPct = ((currentPrice - position.buyPrice) / position.buyPrice) * 100;
+    const heldMs = Date.now() - position.boughtAt;
+    const inPostBuyProtection = heldMs <= POST_BUY_PROTECTION_MS;
+    const oldEnough = heldMs >= MIN_HOLD_MS;
+
+    const peakPrice = Math.max(position.peakPrice ?? position.buyPrice, currentPrice);
+    const peakGainPct = ((peakPrice - position.buyPrice) / position.buyPrice) * 100;
+
+    // Run the same smart sell signal used in maybeExitPosition
+    const smartSell = smartSellSignal(coin, { ...position, peakPrice }, currentPrice, heldMs);
+
+    // Trailing stop
+    const trailActive = peakGainPct >= strategyState.trailActivatePct;
+    const trailPrice = peakPrice * (1 - strategyState.trailStopPct / 100);
+    const hitTrail = trailActive && currentPrice <= trailPrice && (!strategyState.profitOnlyMode || pnlPct > 0);
+
+    // Emergency dump within post-buy window
+    const buySellRatio = coin && coin.sellVolume > 0 ? coin.buyVolume / coin.sellVolume : 1;
+    const negativeFlow = coin ? (coin.capitalFlow || 0) < 0 : false;
+    const phase = coin?.history ? detectPhase(coin.history) : null;
+    const emergencyDump = ALLOW_EMERGENCY_LOSS_EXIT && inPostBuyProtection
+      && pnlPct <= POST_BUY_EMERGENCY_STOP_PCT
+      && (negativeFlow || buySellRatio < 0.95 || phase?.phase === PHASES.PHASE_2);
+
+    // Hard floor stop
+    const hitStop = !strategyState.profitOnlyMode && oldEnough && !trailActive && pnlPct <= -12;
+    const bearishPhase = !strategyState.profitOnlyMode && oldEnough && phase?.phase === PHASES.PHASE_2;
+
+    if (!smartSell.sell && !hitTrail && !hitStop && !bearishPhase && !emergencyDump) continue;
+
+    const outcome = smartSell.sell
+      ? `smart-exit:${smartSell.reason}`
+      : hitTrail ? 'trail-stop'
+      : hitStop ? 'stop'
+      : emergencyDump ? 'post-buy-emergency-stop'
+      : 'phase-break';
+
+    const proceedsUsd = position.qty * currentPrice;
+    const pnlUsd = proceedsUsd - position.investedUsd;
+
+    walletState.cashUsd += proceedsUsd;
+    walletState.realizedPnlUsd += pnlUsd;
+    walletState.openPositions.delete(tokenAddress);
+    botState.totalSoldVolume += proceedsUsd;
+
+    const trade = {
+      symbol: position.symbol,
+      tokenAddress,
+      buyPrice: position.buyPrice,
+      sellPrice: currentPrice,
+      qty: position.qty,
+      investedUsd: position.investedUsd,
+      proceedsUsd,
+      pnlUsd: Number(pnlUsd.toFixed(2)),
+      pnlPct: Number(pnlPct.toFixed(2)),
+      boughtAt: position.boughtAt,
+      soldAt: Date.now(),
+      heldMs,
+      outcome,
+    };
+
+    tradeLog.unshift(trade);
+
+    if (trade.pnlUsd > 0) {
+      blacklist.add(position.symbol);
+    }
+
+    // Sync trackedCoins state so scanAndTrack doesn't re-process this position
+    const tracked = trackedCoins.get(position.symbol);
+    if (tracked) {
+      tracked.status = 'sold';
+      tracked.position = null;
+      tracked.sold = true;
+    }
+
+    updateRealizedPnlPct();
+  }
+}
+
 // Lightweight price refresh — always running, no trading logic
 async function refreshPrices() {
   try {
@@ -1883,6 +1990,10 @@ async function refreshPrices() {
       await refreshOpenPositionPrices();
     }
     updateOpenPositionMarks();
+    // Check exits every 1s so quick-profit and other conditions fire without waiting for the bot scan
+    if (walletState.openPositions.size > 0) {
+      checkOpenPositionExits();
+    }
   } catch (err) {
     botState.lastDataError = err instanceof Error ? err.message : 'Price refresh error';
   }
