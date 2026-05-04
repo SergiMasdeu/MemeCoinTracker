@@ -70,6 +70,15 @@ const ENTRY_GUARD_MIN_LAST2_COMBINED_PCT = Number(process.env.ENTRY_GUARD_MIN_LA
 const ENTRY_GUARD_MIN_BUY_SELL_RATIO = Number(process.env.ENTRY_GUARD_MIN_BUY_SELL_RATIO || 1.2);
 const ENTRY_GUARD_MAX_WINDOW_RISE_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_RISE_PCT || 24);
 const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 1);
+// Memory guard: keep non-position tracked coins only for this long, then move to skipped.
+const TRACKED_TTL_MS = Number(process.env.TRACKED_TTL_MS || 3 * 60 * 1000);
+// New discovery path: lower strictness while keeping low-mid conservative safety checks.
+const NEW_DISCOVERY_WINDOW_MS = Number(process.env.NEW_DISCOVERY_WINDOW_MS || 90_000);
+const NEW_DISCOVERY_MAX_HISTORY_POINTS = Number(process.env.NEW_DISCOVERY_MAX_HISTORY_POINTS || 10);
+const NEW_DISCOVERY_MIN_ACTIVE_USERS = Number(process.env.NEW_DISCOVERY_MIN_ACTIVE_USERS || 16);
+const NEW_DISCOVERY_MIN_BUY_SELL_RATIO = Number(process.env.NEW_DISCOVERY_MIN_BUY_SELL_RATIO || 1.08);
+const NEW_DISCOVERY_MAX_DRAWDOWN_PCT = Number(process.env.NEW_DISCOVERY_MAX_DRAWDOWN_PCT || 14);
+const NEW_DISCOVERY_MIN_M5_PCT = Number(process.env.NEW_DISCOVERY_MIN_M5_PCT || -0.8);
 const POST_BUY_PROTECTION_MS = Number(process.env.POST_BUY_PROTECTION_MS || 90_000);
 const POST_BUY_EMERGENCY_STOP_PCT = Number(process.env.POST_BUY_EMERGENCY_STOP_PCT || -4.5);
 const ALLOW_EMERGENCY_LOSS_EXIT = process.env.ALLOW_EMERGENCY_LOSS_EXIT === 'true';
@@ -915,6 +924,19 @@ function summarizeCoin(coin) {
     && entryQuality.shortMomentumOk
     && entryQuality.liquidityOk
     && entryQuality.volumeLiqOk;
+  const isNewDiscovery = coinAgeMs <= NEW_DISCOVERY_WINDOW_MS && prices.length <= NEW_DISCOVERY_MAX_HISTORY_POINTS;
+  const newDiscoveryConservativeOk = isNewDiscovery
+    && phase.phase === PHASES.PHASE_1
+    && youngEnoughForP1
+    && marketCapOk
+    && socialOk
+    && entryQuality.liquidityOk
+    && drawdownPct <= Math.min(MAX_ENTRY_DRAWDOWN_PCT, NEW_DISCOVERY_MAX_DRAWDOWN_PCT)
+    && pc.m5 >= NEW_DISCOVERY_MIN_M5_PCT
+    && buySellRatio >= NEW_DISCOVERY_MIN_BUY_SELL_RATIO
+    && coin.activeUsers >= NEW_DISCOVERY_MIN_ACTIVE_USERS
+    && coin.capitalFlow >= 0
+    && coin.creatorOwnershipPct < 24;
   const p1CoreOk = phase.phase === PHASES.PHASE_1 && phase1.value && marketCapOk && youngEnoughForP1;
   const canBuyP1 = (
     phase.phase === PHASES.PHASE_1
@@ -922,7 +944,7 @@ function summarizeCoin(coin) {
     && marketCapOk
     && youngEnoughForP1
     && p1EntryQualityOk
-  ) || p1EarlyIndicatorOverride;
+  ) || p1EarlyIndicatorOverride || newDiscoveryConservativeOk;
   const canBuyP1Tv = p1CoreOk && tvBoost && p1EntryQualityOk;
 
   // P3→P4: needs long history + high confidence since phase-3 detection is nuanced
@@ -936,6 +958,8 @@ function summarizeCoin(coin) {
   const canBuy = canBuyP1 || canBuyP3 || canBuyP1Tv || canBuyP3Tv;
   const buyReason = p1EarlyIndicatorOverride
     ? (tvBoost ? 'P1 Early Indicator Override + TV Pattern' : 'P1 Early Indicator Override')
+    : newDiscoveryConservativeOk
+    ? 'P1 New Discovery (Conservative)'
     : canBuyP1
     ? (tvBoost ? 'P1 Early Pump + TV Pattern' : 'P1 Early Pump')
     : canBuyP1Tv
@@ -1003,7 +1027,7 @@ function summarizeCoin(coin) {
     indicators,
     trackHighValue24h: highValueTrackEligible,
     buyChecks: {
-      path: canBuyP1 ? 'P1' : canBuyP3 ? 'P3_BREAKOUT' : null,
+      path: newDiscoveryConservativeOk ? 'P1_DISCOVERY' : canBuyP1 ? 'P1' : canBuyP3 ? 'P3_BREAKOUT' : null,
       common: {
         marketCapOk,
         marketCap: Math.round(coin.marketCap),
@@ -1041,6 +1065,14 @@ function summarizeCoin(coin) {
         minEntryBuySellRatioNoLiq: MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ,
         minEntryActiveUsersNoLiq: MIN_ENTRY_ACTIVE_USERS_NO_LIQ,
         noLiqFallbackOk,
+        isNewDiscovery,
+        newDiscoveryWindowMs: NEW_DISCOVERY_WINDOW_MS,
+        newDiscoveryMaxHistoryPoints: NEW_DISCOVERY_MAX_HISTORY_POINTS,
+        newDiscoveryConservativeOk,
+        newDiscoveryMinBuySellRatio: NEW_DISCOVERY_MIN_BUY_SELL_RATIO,
+        newDiscoveryMinActiveUsers: NEW_DISCOVERY_MIN_ACTIVE_USERS,
+        newDiscoveryMaxDrawdownPct: NEW_DISCOVERY_MAX_DRAWDOWN_PCT,
+        newDiscoveryMinM5Pct: NEW_DISCOVERY_MIN_M5_PCT,
         candlestickPattern: candlestick.pattern,
         candlestickScore: candlestick.score,
         minCandleBullishScore: MIN_CANDLE_BULLISH_SCORE,
@@ -2110,8 +2142,23 @@ async function scanAndTrack() {
       }
     }
 
+    const now = Date.now();
     for (const [symbol, state] of trackedCoins.entries()) {
       if (state.sold) {
+        trackedCoins.delete(symbol);
+        continue;
+      }
+
+      // Prevent unbounded trackedCoins growth: expire stale non-position entries.
+      if (!state.position && now - (state.observedAt || now) >= TRACKED_TTL_MS) {
+        const previousSkip = skippedCoins.get(symbol);
+        skippedCoins.set(symbol, {
+          symbol,
+          reason: `tracked-timeout-${Math.round(TRACKED_TTL_MS / 60_000)}m`,
+          skippedAt: previousSkip?.skippedAt ?? now,
+          lastSeenAt: now,
+          snapshot: state.snapshot,
+        });
         trackedCoins.delete(symbol);
       }
     }
