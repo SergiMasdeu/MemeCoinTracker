@@ -3,6 +3,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Client, GatewayIntentBits, AttachmentBuilder } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,6 +15,7 @@ const PORT = Number(process.env.PORT || 8787);
 const BOT_INTERVAL_MS = Number(process.env.BOT_INTERVAL_MS || 7000);
 const PRICE_REFRESH_MS = Number(process.env.PRICE_REFRESH_MS || 1000);
 const USE_REAL_DATA = process.env.USE_REAL_DATA !== 'false';
+const APP_INSTANCE_ID = process.env.APP_INSTANCE_ID || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 function envBoolean(name, defaultValue) {
   const raw = process.env[name];
@@ -155,6 +157,12 @@ const SELL_RSI_BREAKDOWN_THRESHOLD = Number(process.env.SELL_RSI_BREAKDOWN_THRES
 const SELL_REQUIRE_MACD_WEAKENING = envBoolean('SELL_REQUIRE_MACD_WEAKENING', true);
 // Start trading loop automatically when API boots
 const AUTO_START_BOT = process.env.AUTO_START_BOT !== 'false';
+const DISCORD_NOTIFICATIONS_ENABLED = envBoolean('DISCORD_NOTIFICATIONS_ENABLED', false);
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || '';
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
+const DISCORD_NOTIFY_ON_BUY = envBoolean('DISCORD_NOTIFY_ON_BUY', true);
+const DISCORD_NOTIFY_ON_SELL = envBoolean('DISCORD_NOTIFY_ON_SELL', true);
+const DISCORD_DEDUPE_WINDOW_MS = Number(process.env.DISCORD_DEDUPE_WINDOW_MS || 15_000);
 
 app.use(cors());
 app.use(express.json());
@@ -169,6 +177,98 @@ const skippedCoins = new Map();
 const blacklist = new Set();
 const tradeLog = [];
 const tradingViewSignals = new Map();
+const recentDiscordPayloads = new Map();
+
+function shortenAddress(address) {
+  const value = String(address || '').trim();
+  if (!value) return 'n/a';
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function buildDiscordDedupeKey({ content, embed, attachment }) {
+  const embedFields = Array.isArray(embed?.fields)
+    ? embed.fields.map((field) => ({
+        n: String(field?.name || ''),
+        v: String(field?.value || ''),
+      }))
+    : [];
+
+  const normalized = {
+    content: String(content || ''),
+    embedTitle: String(embed?.title || ''),
+    embedDescription: String(embed?.description || ''),
+    embedFields,
+    attachmentName: String(attachment?.fileName || ''),
+  };
+
+  return JSON.stringify(normalized);
+}
+
+function shouldSkipDiscordDuplicate(payload) {
+  if (!Number.isFinite(DISCORD_DEDUPE_WINDOW_MS) || DISCORD_DEDUPE_WINDOW_MS <= 0) {
+    return false;
+  }
+
+  const now = Date.now();
+  for (const [key, ts] of recentDiscordPayloads.entries()) {
+    if (now - ts > DISCORD_DEDUPE_WINDOW_MS) {
+      recentDiscordPayloads.delete(key);
+    }
+  }
+
+  const dedupeKey = buildDiscordDedupeKey(payload);
+  const previousTs = recentDiscordPayloads.get(dedupeKey);
+  if (previousTs && now - previousTs <= DISCORD_DEDUPE_WINDOW_MS) {
+    return true;
+  }
+
+  recentDiscordPayloads.set(dedupeKey, now);
+  return false;
+}
+
+// ── Persistence ──────────────────────────────────────────────────────────────
+const PERSIST_DIR = path.resolve(__dirname, '../data');
+const BLACKLIST_FILE = path.join(PERSIST_DIR, 'blacklist.json');
+const TRADELOG_FILE = path.join(PERSIST_DIR, 'tradelog.json');
+
+function ensurePersistDir() {
+  if (!fs.existsSync(PERSIST_DIR)) fs.mkdirSync(PERSIST_DIR, { recursive: true });
+}
+
+function loadPersistedState() {
+  ensurePersistDir();
+  blacklist.clear();
+  try {
+    if (fs.existsSync(BLACKLIST_FILE)) {
+      fs.unlinkSync(BLACKLIST_FILE);
+      console.log('[Persist] Cleared previous blacklist on startup.');
+    }
+  } catch (e) { console.warn('[Persist] Failed to clear blacklist:', e.message); }
+  // Closed-position history is intentionally not persisted.
+  // On every restart, wipe any previous file so the bot starts fresh.
+  tradeLog.length = 0;
+  try {
+    if (fs.existsSync(TRADELOG_FILE)) {
+      fs.unlinkSync(TRADELOG_FILE);
+      console.log('[Persist] Cleared previous trade log on startup.');
+    }
+  } catch (e) { console.warn('[Persist] Failed to clear tradelog:', e.message); }
+
+  // Clear Discord dedupe payload cache so notifications start fresh after restart.
+  recentDiscordPayloads.clear();
+}
+
+function saveBlacklist() {
+  // No-op by design: blacklist should not survive process restarts.
+}
+
+function saveTradeLog() {
+  // No-op by design: closed trades should not survive process restarts.
+}
+
+loadPersistedState();
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Cache for DexScreener token-profiles (rate-limited endpoint — refresh at most every 60s)
 const DEX_PROFILES_CACHE_MS = Number(process.env.DEX_PROFILES_CACHE_MS || 60_000);
@@ -193,6 +293,7 @@ const botState = {
   dataMode: USE_REAL_DATA ? 'real' : 'simulated',
   dataSource: USE_REAL_DATA ? 'pump.fun + DexScreener' : 'internal simulation',
   lastDataError: null,
+  lastDiscordError: null,
 };
 
 const strategyPresets = {
@@ -257,6 +358,313 @@ function getStrategySnapshot() {
     conservativeLossMaxPct: CONSERVATIVE_LOSS_MAX_PCT,
     conservativeLossMinBearishSignals: CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS,
   };
+}
+
+function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function formatUsd(value) {
+  return `$${Number(value || 0).toFixed(2)}`;
+}
+
+function formatPct(value) {
+  const n = Number(value || 0);
+  const sign = n >= 0 ? '+' : '';
+  return `${sign}${n.toFixed(2)}%`;
+}
+
+function sanitizeForFilename(value) {
+  return String(value || 'token').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 32) || 'token';
+}
+
+function buildSellCardSvg(trade) {
+  const pnlPositive = Number(trade.pnlPct || 0) >= 0;
+  const accent = pnlPositive ? '#1ecb81' : '#ff5c5c';
+  const token = escapeXml(trade.symbol || 'TOKEN');
+  const pnlPct = escapeXml(formatPct(trade.pnlPct));
+  const pnlUsd = escapeXml(formatUsd(trade.pnlUsd));
+  const buyPrice = escapeXml(Number(trade.buyPrice || 0).toFixed(10));
+  const sellPrice = escapeXml(Number(trade.sellPrice || 0).toFixed(10));
+  const investedUsd = escapeXml(formatUsd(trade.investedUsd));
+  const proceedsUsd = escapeXml(formatUsd(trade.proceedsUsd));
+
+  return `
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0b1220"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1120" height="550" rx="24" fill="#0f172a" stroke="#1f2937" stroke-width="2"/>
+  <rect x="40" y="40" width="1120" height="12" fill="${accent}"/>
+  <text x="90" y="130" fill="#94a3b8" font-size="32" font-family="Arial, sans-serif">BOT SELL ALERT</text>
+  <text x="90" y="220" fill="#f8fafc" font-size="92" font-weight="700" font-family="Arial, sans-serif">${token}</text>
+  <text x="90" y="300" fill="${accent}" font-size="72" font-weight="700" font-family="Arial, sans-serif">${pnlPct}</text>
+  <text x="90" y="350" fill="#cbd5e1" font-size="40" font-family="Arial, sans-serif">PNL ${pnlUsd}</text>
+  <text x="90" y="430" fill="#94a3b8" font-size="28" font-family="Arial, sans-serif">BUY PRICE</text>
+  <text x="90" y="470" fill="#e2e8f0" font-size="34" font-family="Arial, sans-serif">${buyPrice}</text>
+  <text x="420" y="430" fill="#94a3b8" font-size="28" font-family="Arial, sans-serif">SELL PRICE</text>
+  <text x="420" y="470" fill="#e2e8f0" font-size="34" font-family="Arial, sans-serif">${sellPrice}</text>
+  <text x="750" y="430" fill="#94a3b8" font-size="28" font-family="Arial, sans-serif">INVESTED</text>
+  <text x="750" y="470" fill="#e2e8f0" font-size="34" font-family="Arial, sans-serif">${investedUsd}</text>
+  <text x="750" y="520" fill="#94a3b8" font-size="28" font-family="Arial, sans-serif">PROCEEDS</text>
+  <text x="750" y="560" fill="#e2e8f0" font-size="34" font-family="Arial, sans-serif">${proceedsUsd}</text>
+  <text x="90" y="560" fill="#64748b" font-size="22" font-family="Arial, sans-serif">Generated by Pump.Gun Bot</text>
+</svg>`.trim();
+}
+
+// discord.js client — keeps bot online (green dot) via Gateway WebSocket
+const discordClient = DISCORD_NOTIFICATIONS_ENABLED && DISCORD_BOT_TOKEN
+  ? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] })
+  : null;
+
+// ── Report builder ───────────────────────────────────────────────────────────
+function createReportMeta() {
+  const generatedAt = new Date();
+  return {
+    generatedAt,
+    generatedAtIso: generatedAt.toISOString(),
+    generatedAtUnix: Math.floor(generatedAt.getTime() / 1000),
+    reportId: `${generatedAt.getTime().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+  };
+}
+
+function buildReportEmbed(title, sinceMs = 0, dashboard = null, meta = null) {
+  const reportMeta = meta || createReportMeta();
+  const snapshot = dashboard || getDashboard();
+  const now = Date.now();
+  const baseTrades = Array.isArray(snapshot?.trades) ? snapshot.trades : [];
+  const filtered = sinceMs > 0 ? baseTrades.filter((t) => (t.soldAt || 0) >= sinceMs) : baseTrades;
+  const wins = filtered.filter((t) => t.pnlUsd > 0);
+  const losses = filtered.filter((t) => t.pnlUsd <= 0);
+  const totalPnlUsd = filtered.reduce((a, t) => a + (t.pnlUsd || 0), 0);
+  const winRate = filtered.length > 0 ? ((wins.length / filtered.length) * 100).toFixed(1) : '0.0';
+  const avgWinUsd = wins.length > 0 ? wins.reduce((a, t) => a + t.pnlUsd, 0) / wins.length : 0;
+  const avgLossUsd = losses.length > 0 ? losses.reduce((a, t) => a + t.pnlUsd, 0) / losses.length : 0;
+  const bestTrade = filtered.length > 0 ? filtered.reduce((a, b) => (b.pnlPct > a.pnlPct ? b : a), filtered[0]) : null;
+  const worstTrade = filtered.length > 0 ? filtered.reduce((a, b) => (b.pnlPct < a.pnlPct ? b : a), filtered[0]) : null;
+
+  const wallet = snapshot?.wallet || getWalletSnapshot();
+  const pnlPositive = totalPnlUsd >= 0;
+
+  return {
+    title,
+    color: pnlPositive ? 0x1ecb81 : 0xff5c5c,
+    fields: [
+      { name: '💰 Realized PnL', value: formatUsd(totalPnlUsd), inline: true },
+      { name: '📊 Total Equity', value: formatUsd(wallet.equityUsd), inline: true },
+      { name: '💵 Cash', value: formatUsd(wallet.cashUsd), inline: true },
+      { name: '📈 Total Return', value: `${formatUsd(wallet.totalReturnUsd)} (${formatPct(wallet.totalReturnPct)})`, inline: true },
+      { name: '🔓 Open Positions', value: String(wallet?.positions?.length || 0), inline: true },
+      { name: '📋 Trades (period)', value: String(filtered.length), inline: true },
+      { name: '✅ Wins', value: String(wins.length), inline: true },
+      { name: '❌ Losses', value: String(losses.length), inline: true },
+      { name: '🎯 Win Rate', value: `${winRate}%`, inline: true },
+      { name: '⬆️ Avg Win', value: formatUsd(avgWinUsd), inline: true },
+      { name: '⬇️ Avg Loss', value: formatUsd(avgLossUsd), inline: true },
+      { name: '🔖 Blacklisted', value: String(Array.isArray(snapshot?.blacklist) ? snapshot.blacklist.length : blacklist.size), inline: true },
+      { name: '🧭 Data Mode', value: String(snapshot?.bot?.dataMode || botState.dataMode), inline: true },
+      { name: '⏱️ Last Scan', value: snapshot?.bot?.lastScanAt ? new Date(snapshot.bot.lastScanAt).toLocaleTimeString() : 'n/a', inline: true },
+      { name: '🆔 Report ID', value: reportMeta.reportId, inline: true },
+      { name: '🕒 Generated', value: `<t:${reportMeta.generatedAtUnix}:F>`, inline: true },
+      { name: '🧩 Instance', value: APP_INSTANCE_ID, inline: true },
+      ...(bestTrade ? [{ name: '🏆 Best Trade', value: `${bestTrade.symbol} ${formatPct(bestTrade.pnlPct)}`, inline: true }] : []),
+      ...(worstTrade ? [{ name: '💀 Worst Trade', value: `${worstTrade.symbol} ${formatPct(worstTrade.pnlPct)}`, inline: true }] : []),
+    ],
+    timestamp: reportMeta.generatedAtIso,
+    footer: { text: `Pump.Gun Bot • ${reportMeta.reportId}` },
+  };
+}
+
+// ── Scheduled reports ─────────────────────────────────────────────────────────
+function scheduleDailyReport() {
+  const now = new Date();
+  const next = new Date();
+  next.setHours(23, 59, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  const delay = next.getTime() - now.getTime();
+  setTimeout(async () => {
+    await refreshPrices().catch(() => {});
+    const snapshot = getDashboard();
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    const reportMeta = createReportMeta();
+    void sendDiscordBotMessage({
+      content: `📅 **Daily Report** • id:${reportMeta.reportId} • <t:${reportMeta.generatedAtUnix}:T>`,
+      embed: buildReportEmbed('📅 Daily Performance Report', since, snapshot, reportMeta),
+    });
+    scheduleDailyReport();
+  }, delay);
+}
+
+function scheduleWeeklyReport() {
+  const now = new Date();
+  // Fire every Sunday at 23:58
+  const next = new Date();
+  next.setHours(23, 58, 0, 0);
+  const daysUntilSunday = (7 - now.getDay()) % 7 || 7;
+  next.setDate(now.getDate() + daysUntilSunday);
+  if (next <= now) next.setDate(next.getDate() + 7);
+  const delay = next.getTime() - now.getTime();
+  setTimeout(async () => {
+    await refreshPrices().catch(() => {});
+    const snapshot = getDashboard();
+    const since = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const reportMeta = createReportMeta();
+    void sendDiscordBotMessage({
+      content: `📆 **Weekly Report** • id:${reportMeta.reportId} • <t:${reportMeta.generatedAtUnix}:T>`,
+      embed: buildReportEmbed('📆 Weekly Performance Report', since, snapshot, reportMeta),
+    });
+    scheduleWeeklyReport();
+  }, delay);
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Discord startup diagnostics ───────────────────────────────────────────────
+console.log('[Discord] DISCORD_NOTIFICATIONS_ENABLED =', DISCORD_NOTIFICATIONS_ENABLED);
+console.log('[Discord] DISCORD_BOT_TOKEN set         =', Boolean(DISCORD_BOT_TOKEN));
+console.log('[Discord] DISCORD_CHANNEL_ID            =', DISCORD_CHANNEL_ID || '(not set)');
+console.log('[Discord] client created                =', Boolean(discordClient));
+// ─────────────────────────────────────────────────────────────────────────────
+
+if (discordClient) {
+  discordClient.once('clientReady', async () => {
+    console.log(`[Discord] Logged in as ${discordClient.user.tag}`);
+    console.log(`[Discord] Watching channel ID: ${DISCORD_CHANNEL_ID}`);
+    await sendDiscordBotMessage({
+      content: 'Hi I am the Meme Coin Tracker. I Started to Track Coins.',
+    });
+    scheduleDailyReport();
+    scheduleWeeklyReport();
+  });
+
+  // /report command listener
+  discordClient.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    console.log(`[Discord] Message received in channel ${message.channelId}: "${message.content}"`);
+    if (message.channelId !== DISCORD_CHANNEL_ID) {
+      console.log(`[Discord] Ignored — expected channel ${DISCORD_CHANNEL_ID}`);
+      return;
+    }
+    const text = message.content.trim().toLowerCase();
+    if (text === '/report') {
+      console.log('[Discord] /report triggered — sending report embed');
+      await refreshPrices().catch(() => {});
+      const snapshot = getDashboard();
+      const reportMeta = createReportMeta();
+      await sendDiscordBotMessage({
+        content: `📊 **On-Demand Report** • id:${reportMeta.reportId} • <t:${reportMeta.generatedAtUnix}:T>`,
+        embed: buildReportEmbed('📊 Full Performance Report', 0, snapshot, reportMeta),
+        bypassDedupe: true,
+      });
+    }
+  });
+
+  discordClient.login(DISCORD_BOT_TOKEN).catch((err) => {
+    botState.lastDiscordError = `Discord login failed: ${err?.message || err}`;
+    console.error('[Discord] Login failed:', err?.message || err);
+  });
+} else {
+  console.warn('[Discord] Client not created. Check DISCORD_NOTIFICATIONS_ENABLED, DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID in .env');
+}
+
+async function sendDiscordBotMessage({ content, embed, attachment, bypassDedupe = false }) {
+  if (!DISCORD_NOTIFICATIONS_ENABLED || !discordClient || !DISCORD_CHANNEL_ID) return;
+
+  if (!bypassDedupe && shouldSkipDiscordDuplicate({ content, embed, attachment })) {
+    console.log('[Discord] Duplicate payload skipped');
+    return;
+  }
+
+  try {
+    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+    if (!channel || !channel.isTextBased()) {
+      throw new Error(`Channel ${DISCORD_CHANNEL_ID} not found or not text-based`);
+    }
+
+    const messageOptions = {
+      content,
+      embeds: embed ? [embed] : [],
+    };
+
+    if (attachment) {
+      const file = new AttachmentBuilder(
+        Buffer.from(attachment.content),
+        { name: attachment.fileName },
+      );
+      messageOptions.files = [file];
+    }
+
+    await channel.send(messageOptions);
+    botState.lastDiscordError = null;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : 'Unknown Discord API error';
+    botState.lastDiscordError = msg;
+    console.error('[Discord] Send error:', msg);
+  }
+}
+
+function notifyBuy(summary, bought) {
+  if (!DISCORD_NOTIFY_ON_BUY) return;
+
+  const entryScore = Number(summary?.analysis?.entryScore || 0).toFixed(2);
+  const shortAddress = shortenAddress(summary.address);
+  void sendDiscordBotMessage({
+    content: `BUY ${summary.symbol} (${shortAddress})`,
+    embed: {
+      title: `BUY EXECUTED: ${summary.symbol}`,
+      color: 0x1ecb81,
+      description: `Token: ${summary.name || summary.symbol}`,
+      fields: [
+        { name: 'Address', value: shortAddress, inline: true },
+        { name: 'Price', value: String(Number(summary.price || 0).toFixed(10)), inline: true },
+        { name: 'Invested', value: formatUsd(bought.investedUsd), inline: true },
+        { name: 'Qty', value: String(Number(bought.qty || 0).toFixed(4)), inline: true },
+        { name: 'Entry Score', value: entryScore, inline: true },
+        { name: 'Market Cap', value: formatUsd(summary.marketCap), inline: true },
+        { name: 'Liquidity', value: formatUsd(summary.liquidityUsd), inline: true },
+      ],
+      timestamp: new Date().toISOString(),
+    },
+  });
+}
+
+function notifySell(trade) {
+  if (!DISCORD_NOTIFY_ON_SELL) return;
+
+  const fileName = `sell-${sanitizeForFilename(trade.symbol)}-${Date.now()}.svg`;
+  const cardSvg = buildSellCardSvg(trade);
+
+  void sendDiscordBotMessage({
+    content: `SELL ${trade.symbol} ${formatPct(trade.pnlPct)}`,
+    embed: {
+      title: `SELL EXECUTED: ${trade.symbol}`,
+      color: Number(trade.pnlPct || 0) >= 0 ? 0x1ecb81 : 0xff5c5c,
+      description: `Outcome: ${trade.outcome}`,
+      fields: [
+        { name: 'PnL %', value: formatPct(trade.pnlPct), inline: true },
+        { name: 'PnL USD', value: formatUsd(trade.pnlUsd), inline: true },
+        { name: 'Held (min)', value: String(Math.round((trade.heldMs || 0) / 60_000)), inline: true },
+        { name: 'Buy', value: String(Number(trade.buyPrice || 0).toFixed(10)), inline: true },
+        { name: 'Sell', value: String(Number(trade.sellPrice || 0).toFixed(10)), inline: true },
+        { name: 'Proceeds', value: formatUsd(trade.proceedsUsd), inline: true },
+      ],
+      image: { url: `attachment://${fileName}` },
+      timestamp: new Date().toISOString(),
+    },
+    attachment: {
+      fileName,
+      content: cardSvg,
+      contentType: 'image/svg+xml',
+    },
+  });
 }
 
 function hasOpenPositionCapacity() {
@@ -976,7 +1384,7 @@ function executeBuy(summary) {
 
   walletState.openPositions.set(summary.address, position);
 
-  return {
+  const bought = {
     symbol: summary.symbol,
     tokenAddress: summary.address,
     qty: sizing.qty,
@@ -984,6 +1392,9 @@ function executeBuy(summary) {
     investedUsd: sizing.investedUsd,
     boughtAt: position.boughtAt,
   };
+
+  notifyBuy(summary, bought);
+  return bought;
 }
 
 function entryExecutionGuard(summary) {
@@ -1260,7 +1671,11 @@ function maybeExitPosition(summary, state) {
 
   if (trade.pnlUsd > 0) {
     blacklist.add(summary.symbol);
+    saveBlacklist();
   }
+  saveTradeLog();
+
+  notifySell(trade);
 
   return trade;
 }
@@ -1708,10 +2123,12 @@ async function refreshMarketData() {
     botState.dataSource = realDataResult.source;
     botState.lastDataError = realDataResult.warning;
   } catch (error) {
-    botState.lastDataError = error instanceof Error ? error.message : 'Unknown data fetch error';
-    ingestSimulatedData();
-    botState.dataMode = 'simulated-fallback';
-    botState.dataSource = 'fallback simulation (real fetch failed)';
+    const errMsg = error instanceof Error ? error.message : 'Unknown data fetch error';
+    botState.lastDataError = errMsg;
+    // Stay in real mode and wait for next refresh instead of switching to simulation.
+    // This preserves current open-position tracking and avoids mixing synthetic prices.
+    botState.dataMode = 'real-waiting';
+    botState.dataSource = `real discovery paused: ${errMsg}`;
   }
 }
 
@@ -1842,7 +2259,11 @@ function checkOpenPositionExits() {
 
     if (trade.pnlUsd > 0) {
       blacklist.add(position.symbol);
+      saveBlacklist();
     }
+    saveTradeLog();
+
+    notifySell(trade);
 
     // Sync trackedCoins state so scanAndTrack doesn't re-process this position
     const tracked = trackedCoins.get(position.symbol);
@@ -2066,6 +2487,13 @@ function getDashboard() {
         signalTtlMs: TRADINGVIEW_SIGNAL_TTL_MS,
         minBullishScore: TRADINGVIEW_MIN_BULLISH_SCORE,
       },
+      discord: {
+        enabled: DISCORD_NOTIFICATIONS_ENABLED,
+        configured: Boolean(DISCORD_BOT_TOKEN && DISCORD_CHANNEL_ID),
+        notifyOnBuy: DISCORD_NOTIFY_ON_BUY,
+        notifyOnSell: DISCORD_NOTIFY_ON_SELL,
+        lastError: botState.lastDiscordError,
+      },
       strategy: getStrategySnapshot(),
     },
     wallet: getWalletSnapshot(),
@@ -2115,6 +2543,13 @@ app.get('/api/health', (_req, res) => {
         activeSignals: activeSignals.length,
         signalTtlMs: TRADINGVIEW_SIGNAL_TTL_MS,
         minBullishScore: TRADINGVIEW_MIN_BULLISH_SCORE,
+      },
+      discord: {
+        enabled: DISCORD_NOTIFICATIONS_ENABLED,
+        configured: Boolean(DISCORD_BOT_TOKEN && DISCORD_CHANNEL_ID),
+        notifyOnBuy: DISCORD_NOTIFY_ON_BUY,
+        notifyOnSell: DISCORD_NOTIFY_ON_SELL,
+        lastError: botState.lastDiscordError,
       },
     },
   });
@@ -2305,6 +2740,8 @@ app.listen(PORT, async () => {
     });
     console.log(`Trading loop auto-start: ${botState.running ? 'ON' : 'FAILED'}`);
   }
+
+  // Discord startup greeting is sent inside the clientReady event handler above
 });
 
 process.on('unhandledRejection', (reason) => {
