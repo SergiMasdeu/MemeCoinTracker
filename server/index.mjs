@@ -3,7 +3,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Client, GatewayIntentBits, AttachmentBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, AttachmentBuilder, REST, Routes, SlashCommandBuilder } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -110,6 +110,16 @@ const CONSERVATIVE_LOSS_MAX_BUY_SELL_RATIO = Number(process.env.CONSERVATIVE_LOS
 const CONSERVATIVE_LOSS_RSI_MAX = Number(process.env.CONSERVATIVE_LOSS_RSI_MAX || 34);
 const CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT = Number(process.env.CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT || 7.5);
 const CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS = Number(process.env.CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS || 3);
+// Fast crash-protection exits: cut likely rugs earlier than conservative loss logic.
+const CRASH_PROTECTION_ENABLED = envBoolean('CRASH_PROTECTION_ENABLED', true);
+const CRASH_PROTECTION_MIN_HOLD_MS = Number(process.env.CRASH_PROTECTION_MIN_HOLD_MS || 90_000);
+const CRASH_PROTECTION_ARM_PCT = Number(process.env.CRASH_PROTECTION_ARM_PCT || -6);
+const CRASH_PROTECTION_HARD_STOP_PCT = Number(process.env.CRASH_PROTECTION_HARD_STOP_PCT || -14);
+const CRASH_PROTECTION_PEAK_DROP_PCT = Number(process.env.CRASH_PROTECTION_PEAK_DROP_PCT || 12);
+const CRASH_PROTECTION_RECENT_DRAWDOWN_PCT = Number(process.env.CRASH_PROTECTION_RECENT_DRAWDOWN_PCT || 8.5);
+const CRASH_PROTECTION_MAX_BUY_SELL_RATIO = Number(process.env.CRASH_PROTECTION_MAX_BUY_SELL_RATIO || 0.74);
+const CRASH_PROTECTION_RSI_MAX = Number(process.env.CRASH_PROTECTION_RSI_MAX || 38);
+const CRASH_PROTECTION_MIN_BEARISH_SIGNALS = Number(process.env.CRASH_PROTECTION_MIN_BEARISH_SIGNALS || 2);
 // Once unrealized PnL exceeds this, activate trailing stop
 const DEFAULT_TRAIL_ACTIVATE_PCT = Number(process.env.TRAIL_ACTIVATE_PCT || 10);
 // Trail stop: close when price falls this far below the peak seen while holding
@@ -160,6 +170,7 @@ const AUTO_START_BOT = process.env.AUTO_START_BOT !== 'false';
 const DISCORD_NOTIFICATIONS_ENABLED = envBoolean('DISCORD_NOTIFICATIONS_ENABLED', false);
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || '';
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID || '';
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '';
 const DISCORD_NOTIFY_ON_BUY = envBoolean('DISCORD_NOTIFY_ON_BUY', true);
 const DISCORD_NOTIFY_ON_SELL = envBoolean('DISCORD_NOTIFY_ON_SELL', true);
 const DISCORD_DEDUPE_WINDOW_MS = Number(process.env.DISCORD_DEDUPE_WINDOW_MS || 15_000);
@@ -357,6 +368,12 @@ function getStrategySnapshot() {
     conservativeLossArmPct: CONSERVATIVE_LOSS_ARM_PCT,
     conservativeLossMaxPct: CONSERVATIVE_LOSS_MAX_PCT,
     conservativeLossMinBearishSignals: CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS,
+    crashProtectionEnabled: CRASH_PROTECTION_ENABLED,
+    crashProtectionMinHoldMs: CRASH_PROTECTION_MIN_HOLD_MS,
+    crashProtectionArmPct: CRASH_PROTECTION_ARM_PCT,
+    crashProtectionHardStopPct: CRASH_PROTECTION_HARD_STOP_PCT,
+    crashProtectionPeakDropPct: CRASH_PROTECTION_PEAK_DROP_PCT,
+    crashProtectionMinBearishSignals: CRASH_PROTECTION_MIN_BEARISH_SIGNALS,
   };
 }
 
@@ -423,7 +440,7 @@ function buildSellCardSvg(trade) {
 
 // discord.js client — keeps bot online (green dot) via Gateway WebSocket
 const discordClient = DISCORD_NOTIFICATIONS_ENABLED && DISCORD_BOT_TOKEN
-  ? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] })
+  ? new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] })
   : null;
 
 // ── Report builder ───────────────────────────────────────────────────────────
@@ -525,12 +542,49 @@ function scheduleWeeklyReport() {
     scheduleWeeklyReport();
   }, delay);
 }
+
+async function sendOnDemandDiscordReport(sourceLabel = 'manual') {
+  await refreshPrices().catch(() => {});
+  const snapshot = getDashboard();
+  const reportMeta = createReportMeta();
+  await sendDiscordBotMessage({
+    content: `📊 **On-Demand Report** • id:${reportMeta.reportId} • <t:${reportMeta.generatedAtUnix}:T> • via:${sourceLabel}`,
+    embed: buildReportEmbed('📊 Full Performance Report', 0, snapshot, reportMeta),
+    bypassDedupe: true,
+  });
+}
+
+async function registerDiscordSlashCommands(clientUserId) {
+  if (!DISCORD_BOT_TOKEN) return;
+
+  const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('report')
+      .setDescription('Post the latest bot performance report to the configured channel')
+      .toJSON(),
+  ];
+
+  if (DISCORD_GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(clientUserId, DISCORD_GUILD_ID), {
+      body: commands,
+    });
+    console.log(`[Discord] Registered slash commands for guild ${DISCORD_GUILD_ID}`);
+    return;
+  }
+
+  await rest.put(Routes.applicationCommands(clientUserId), {
+    body: commands,
+  });
+  console.log('[Discord] Registered global slash commands (propagation may take time)');
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Discord startup diagnostics ───────────────────────────────────────────────
 console.log('[Discord] DISCORD_NOTIFICATIONS_ENABLED =', DISCORD_NOTIFICATIONS_ENABLED);
 console.log('[Discord] DISCORD_BOT_TOKEN set         =', Boolean(DISCORD_BOT_TOKEN));
 console.log('[Discord] DISCORD_CHANNEL_ID            =', DISCORD_CHANNEL_ID || '(not set)');
+console.log('[Discord] DISCORD_GUILD_ID              =', DISCORD_GUILD_ID || '(not set)');
 console.log('[Discord] client created                =', Boolean(discordClient));
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -540,6 +594,11 @@ if (discordClient) {
     console.log(`[Discord] Watching channel ID: ${DISCORD_CHANNEL_ID}`);
     await sendDiscordBotMessage({
       content: 'Hi I am the Meme Coin Tracker. I Started to Track Coins.',
+    });
+    await registerDiscordSlashCommands(discordClient.user.id).catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err || 'Unknown slash registration error');
+      botState.lastDiscordError = `Discord slash command registration failed: ${msg}`;
+      console.error('[Discord] Slash command registration failed:', msg);
     });
     scheduleDailyReport();
     scheduleWeeklyReport();
@@ -556,15 +615,26 @@ if (discordClient) {
     const text = message.content.trim().toLowerCase();
     if (text === '/report') {
       console.log('[Discord] /report triggered — sending report embed');
-      await refreshPrices().catch(() => {});
-      const snapshot = getDashboard();
-      const reportMeta = createReportMeta();
-      await sendDiscordBotMessage({
-        content: `📊 **On-Demand Report** • id:${reportMeta.reportId} • <t:${reportMeta.generatedAtUnix}:T>`,
-        embed: buildReportEmbed('📊 Full Performance Report', 0, snapshot, reportMeta),
-        bypassDedupe: true,
-      });
+      await sendOnDemandDiscordReport('text-command');
     }
+  });
+
+  discordClient.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== 'report') return;
+
+    const inConfiguredChannel = !DISCORD_CHANNEL_ID || interaction.channelId === DISCORD_CHANNEL_ID;
+    if (!inConfiguredChannel) {
+      await interaction.reply({
+        ephemeral: true,
+        content: `Use /report in the configured channel: ${DISCORD_CHANNEL_ID}`,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+    await sendOnDemandDiscordReport(`slash:${interaction.user.username}`);
+    await interaction.editReply('Report posted.');
   });
 
   discordClient.login(DISCORD_BOT_TOKEN).catch((err) => {
@@ -1487,6 +1557,45 @@ function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const buySellRatio = (coin?.sellVolume || 0) > 0 ? coin.buyVolume / coin.sellVolume : 1;
   const negativeFlow = (coin?.capitalFlow || 0) < 0;
   const trend = getTrendBreakdown(prices);
+
+  // Fast crash-protection path to prevent catastrophic bag-holding on rugs.
+  if (CRASH_PROTECTION_ENABLED && heldMs >= CRASH_PROTECTION_MIN_HOLD_MS) {
+    const crashArmPct = -Math.abs(CRASH_PROTECTION_ARM_PCT);
+    const crashHardStopPct = -Math.abs(CRASH_PROTECTION_HARD_STOP_PCT);
+    const crashPeakDropFloorPct = -Math.abs(CRASH_PROTECTION_PEAK_DROP_PCT);
+    const peakDropFromTopPct = peakPrice > 0
+      ? ((currentPrice - peakPrice) / peakPrice) * 100
+      : 0;
+
+    if (pnlPct <= crashHardStopPct) {
+      return { sell: true, reason: `crash-hard-stop-${Math.abs(crashHardStopPct)}pct` };
+    }
+
+    if (prices.length >= 4) {
+      const last3 = prices.slice(-3);
+      const threeDrops = last3[2] < last3[1] && last3[1] < last3[0];
+
+      const recentPrices = prices.slice(-6);
+      const firstRecent = recentPrices[0] || currentPrice;
+      const recentDrawdownPct = firstRecent > 0
+        ? ((currentPrice - firstRecent) / firstRecent) * 100
+        : 0;
+
+      const crashSignals = [
+        trend.bearish,
+        peakDropFromTopPct <= crashPeakDropFloorPct,
+        negativeFlow && buySellRatio <= CRASH_PROTECTION_MAX_BUY_SELL_RATIO,
+        indicators.dataReady
+          && indicators.rsi <= CRASH_PROTECTION_RSI_MAX
+          && (!SELL_REQUIRE_MACD_WEAKENING || indicators.macdWeakening),
+        threeDrops && recentDrawdownPct <= -Math.abs(CRASH_PROTECTION_RECENT_DRAWDOWN_PCT),
+      ].filter(Boolean).length;
+
+      if (pnlPct <= crashArmPct && crashSignals >= CRASH_PROTECTION_MIN_BEARISH_SIGNALS) {
+        return { sell: true, reason: `crash-protect-${crashSignals}signals` };
+      }
+    }
+  }
 
   // Conservative loss path: only exit losers when bearish evidence is strong.
   if (CONSERVATIVE_LOSS_EXIT_ENABLED && pnlPct <= CONSERVATIVE_LOSS_ARM_PCT && heldMs >= CONSERVATIVE_LOSS_MIN_HOLD_MS) {

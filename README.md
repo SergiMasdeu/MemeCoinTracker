@@ -9,6 +9,8 @@ It now includes:
 
 - Option A composite scoring: momentum + flow + liquidity + risk + catalyst
 - Conservative risk controls for entries and exits
+- Discord Bot notifications on buy/sell (Bot Token + Channel ID)
+- Auto-generated sell image card (token, PnL %, prices, invested/proceeds)
 
 ## Trading rule implemented
 
@@ -51,6 +53,18 @@ It now includes:
 - `USE_REAL_DATA` (default `true`; set `false` to force simulation)
 - `BOT_INTERVAL_MS` (default `7000`)
 - `MAX_OPEN_POSITIONS` (default `unlimited`; set to a positive number to cap concurrent positions)
+- `DISCORD_NOTIFICATIONS_ENABLED` (default `false`)
+- `DISCORD_BOT_TOKEN` (Discord bot token)
+- `DISCORD_CHANNEL_ID` (target Discord channel ID)
+- `DISCORD_GUILD_ID` (optional; recommended for instant slash-command updates in one server)
+- `DISCORD_NOTIFY_ON_BUY` (default `true`)
+- `DISCORD_NOTIFY_ON_SELL` (default `true`)
+
+Discord command:
+
+- `/report` posts an on-demand performance report to the configured channel.
+- If `DISCORD_GUILD_ID` is set, slash command registration is near-instant for that guild.
+- Without `DISCORD_GUILD_ID`, global command propagation can take several minutes.
 
 Indicator tuning (entry and exits):
 
@@ -93,6 +107,18 @@ Conservative loss-management exits:
 - `CONSERVATIVE_LOSS_RSI_MAX` (default `34`)
 - `CONSERVATIVE_LOSS_RECENT_DRAWDOWN_PCT` (default `7.5`)
 - `CONSERVATIVE_LOSS_MIN_BEARISH_SIGNALS` (default `3`)
+
+Crash-protection exits (early rug/cascade defense):
+
+- `CRASH_PROTECTION_ENABLED` (default `true`)
+- `CRASH_PROTECTION_MIN_HOLD_MS` (default `90000`)
+- `CRASH_PROTECTION_ARM_PCT` (default `-6`)
+- `CRASH_PROTECTION_HARD_STOP_PCT` (default `-14`)
+- `CRASH_PROTECTION_PEAK_DROP_PCT` (default `12`)
+- `CRASH_PROTECTION_RECENT_DRAWDOWN_PCT` (default `8.5`)
+- `CRASH_PROTECTION_MAX_BUY_SELL_RATIO` (default `0.74`)
+- `CRASH_PROTECTION_RSI_MAX` (default `38`)
+- `CRASH_PROTECTION_MIN_BEARISH_SIGNALS` (default `2`)
 
 Legacy phase-tuning variables are no longer used for entry decisions.
 
