@@ -1,10 +1,11 @@
-# Pump.Gun Memecoin Tracker + Bot
+# MEXC REST Memecoin Tracker + Bot
 
-React dashboard + Node bot engine that scans memecoins and ranks each coin with Option A score analysis.
+React dashboard + Node bot engine that scans memecoins from MEXC REST market data and ranks each coin with Option A score analysis.
 
 It now includes:
 
-- Real market data mode (Pump.fun discovery + DexScreener market metrics)
+- Real market data mode (MEXC REST discovery)
+- Tracks solid and liquid memecoins listed on MEXC
 - Virtual paper wallet starting at $10,000
 
 - Option A composite scoring: momentum + flow + liquidity + risk + catalyst
@@ -17,7 +18,7 @@ It now includes:
 - Bot tracks coins when Option A score passes watch thresholds.
 - Bot buys only when Option A entry score and quality floors are all satisfied.
 - Bot tracks total buy volume and total sell volume.
-- After a profitable sell, that coin is blacklisted and never tracked again in this runtime.
+- Coins can be bought multiple times (no blacklist after profitable sells).
 
 ## What is tracked
 

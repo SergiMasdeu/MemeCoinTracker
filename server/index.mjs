@@ -14,8 +14,19 @@ const app = express();
 const PORT = Number(process.env.PORT || 8787);
 const BOT_INTERVAL_MS = Number(process.env.BOT_INTERVAL_MS || 7000);
 const PRICE_REFRESH_MS = Number(process.env.PRICE_REFRESH_MS || 1000);
+const MARKET_REFRESH_MS = Number(process.env.MARKET_REFRESH_MS || 15_000);
 const USE_REAL_DATA = process.env.USE_REAL_DATA !== 'false';
 const APP_INSTANCE_ID = process.env.APP_INSTANCE_ID || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const MEXC_BASE_URLS = (process.env.MEXC_BASE_URLS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const DEFAULT_MEXC_BASE_URLS = [
+  'https://api.mexc.com',
+];
+const ACTIVE_MEXC_BASE_URLS = MEXC_BASE_URLS.length > 0
+  ? MEXC_BASE_URLS
+  : DEFAULT_MEXC_BASE_URLS;
 
 function envBoolean(name, defaultValue) {
   const raw = process.env[name];
@@ -37,10 +48,10 @@ const MAX_OPEN_POSITIONS = process.env.MAX_OPEN_POSITIONS === undefined
 // Coin must be younger than this for a P1 buy (3 hours)
 const MAX_COIN_AGE_P1_MS = Number(process.env.MAX_COIN_AGE_P1_MS || 3 * 60 * 60 * 1000);
 // Option A (score-based): entry requires a minimum composite score and quality floors.
-const OPTION_A_MIN_ENTRY_SCORE = Number(process.env.OPTION_A_MIN_ENTRY_SCORE || 0.68);
+const OPTION_A_MIN_ENTRY_SCORE = Number(process.env.OPTION_A_MIN_ENTRY_SCORE || 0.58);
 const OPTION_A_TRACK_MIN_SCORE = Number(process.env.OPTION_A_TRACK_MIN_SCORE || 0.44);
-const OPTION_A_MIN_MOMENTUM_SCORE = Number(process.env.OPTION_A_MIN_MOMENTUM_SCORE || 0.52);
-const OPTION_A_MIN_FLOW_SCORE = Number(process.env.OPTION_A_MIN_FLOW_SCORE || 0.58);
+const OPTION_A_MIN_MOMENTUM_SCORE = Number(process.env.OPTION_A_MIN_MOMENTUM_SCORE || 0.5);
+const OPTION_A_MIN_FLOW_SCORE = Number(process.env.OPTION_A_MIN_FLOW_SCORE || 0.32);
 const OPTION_A_MIN_RISK_SCORE = Number(process.env.OPTION_A_MIN_RISK_SCORE || 0.50);
 const OPTION_A_TV_SCORE_BONUS = Number(process.env.OPTION_A_TV_SCORE_BONUS || 0.05);
 // No default age ceiling — older coins are allowed as long as they pass score gates.
@@ -67,30 +78,40 @@ const TRADINGVIEW_MIN_BULLISH_SCORE = Number(process.env.TRADINGVIEW_MIN_BULLISH
 const MAX_ENTRY_DRAWDOWN_PCT = Number(process.env.MAX_ENTRY_DRAWDOWN_PCT || 18);
 const MIN_ENTRY_M5_PCT = Number(process.env.MIN_ENTRY_M5_PCT || -1.8);
 const MIN_ENTRY_H1_PCT = Number(process.env.MIN_ENTRY_H1_PCT || -4);
-const MIN_ENTRY_BUY_SELL_RATIO = Number(process.env.MIN_ENTRY_BUY_SELL_RATIO || 1.03);
+const MIN_ENTRY_BUY_SELL_RATIO = Number(process.env.MIN_ENTRY_BUY_SELL_RATIO || 1.0);
 const MIN_ENTRY_LIQUIDITY_USD = Number(process.env.MIN_ENTRY_LIQUIDITY_USD || 10_000);
 const MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ = Number(process.env.MIN_ENTRY_BUY_SELL_RATIO_NO_LIQ || 1.6);
 const MIN_ENTRY_ACTIVE_USERS_NO_LIQ = Number(process.env.MIN_ENTRY_ACTIVE_USERS_NO_LIQ || 22);
 const MIN_VOL_LIQ_RATIO = Number(process.env.MIN_VOL_LIQ_RATIO || 0.35);
 const MAX_VOL_LIQ_RATIO = Number(process.env.MAX_VOL_LIQ_RATIO || 30);
 const MIN_CANDLE_BULLISH_SCORE = Number(process.env.MIN_CANDLE_BULLISH_SCORE || 0.55);
+const LEVERAGE_MULTIPLIER = Number(process.env.LEVERAGE_MULTIPLIER || 20);
+const STABLE_ASSET_PREFIXES = [
+  'USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'DAI', 'PAX', 'USDP', 'PYUSD', 'EUR', 'EURC', 'TRY', 'BRL', 'AUD', 'GBP', 'JPY', 'CHF', 'MXN', 'IDRT', 'VAI', 'XUSD', 'UST', 'USTC', 'GUSD', 'SUSD', 'LUSD', 'USDE', 'RLUSD', 'USD0', 'USD1', 'FRAX', 'USDD', 'XAUT', 'PAXG'
+];
 // Legacy phase tuning kept for backwards compatibility in env files (phase logic removed from strategy).
 // Recheck skipped symbols after cooldown instead of suppressing forever.
 const SKIP_RECHECK_MS = Number(process.env.SKIP_RECHECK_MS || 3 * 60 * 1000);
 // Entry execution safety: avoid buying into immediate reversals and cut instant dumps.
 const ENTRY_GUARD_WINDOW_POINTS = Number(process.env.ENTRY_GUARD_WINDOW_POINTS || 6);
-const ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT || 15);
-const ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT = Number(process.env.ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT || 6);
-const ENTRY_GUARD_MIN_LAST2_COMBINED_PCT = Number(process.env.ENTRY_GUARD_MIN_LAST2_COMBINED_PCT || -5);
-const ENTRY_GUARD_MIN_BUY_SELL_RATIO = Number(process.env.ENTRY_GUARD_MIN_BUY_SELL_RATIO || 1.2);
-const ENTRY_GUARD_MAX_WINDOW_RISE_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_RISE_PCT || 24);
-const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 1);
+const ENTRY_GUARD_ENABLED = envBoolean('ENTRY_GUARD_ENABLED', false);
+const ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_DRAWDOWN_PCT || 30);
+const ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT = Number(process.env.ENTRY_GUARD_MAX_LAST_TICK_DROP_PCT || 12);
+const ENTRY_GUARD_MIN_LAST2_COMBINED_PCT = Number(process.env.ENTRY_GUARD_MIN_LAST2_COMBINED_PCT || -10);
+const ENTRY_GUARD_MIN_BUY_SELL_RATIO = Number(process.env.ENTRY_GUARD_MIN_BUY_SELL_RATIO || 0.9);
+const ENTRY_GUARD_MAX_WINDOW_RISE_PCT = Number(process.env.ENTRY_GUARD_MAX_WINDOW_RISE_PCT || 45);
+const BUY_CONFIRMATION_SCANS = Number(process.env.BUY_CONFIRMATION_SCANS || 0);
 // Memory guard: keep non-position tracked coins only for this long, then move to skipped.
 const TRACKED_TTL_MS = Number(process.env.TRACKED_TTL_MS || 3 * 60 * 1000);
 // Hard size caps — evict oldest entries when maps exceed these limits.
-const MAX_MARKET_STATE_SIZE = Number(process.env.MAX_MARKET_STATE_SIZE || 60);
-const MAX_TRACKED_COINS_SIZE = Number(process.env.MAX_TRACKED_COINS_SIZE || 30);
+const MAX_MARKET_STATE_SIZE = process.env.MAX_MARKET_STATE_SIZE !== undefined
+  ? Number(process.env.MAX_MARKET_STATE_SIZE)
+  : 500;
+const MAX_TRACKED_COINS_SIZE = process.env.MAX_TRACKED_COINS_SIZE !== undefined
+  ? Number(process.env.MAX_TRACKED_COINS_SIZE)
+  : 120;
 const MAX_SKIPPED_COINS_SIZE = Number(process.env.MAX_SKIPPED_COINS_SIZE || 100);
+const TRACK_UNIVERSE_LIMIT = Number(process.env.TRACK_UNIVERSE_LIMIT || 120);
 // New discovery path: lower strictness while keeping low-mid conservative safety checks.
 const NEW_DISCOVERY_WINDOW_MS = Number(process.env.NEW_DISCOVERY_WINDOW_MS || 90_000);
 const NEW_DISCOVERY_MAX_HISTORY_POINTS = Number(process.env.NEW_DISCOVERY_MAX_HISTORY_POINTS || 10);
@@ -189,6 +210,9 @@ const blacklist = new Set();
 const tradeLog = [];
 const tradingViewSignals = new Map();
 const recentDiscordPayloads = new Map();
+let lastMarketRefreshAt = 0;
+let lastMexcSuccessHost = '';
+let mexcCooldownUntil = 0;
 
 function shortenAddress(address) {
   const value = String(address || '').trim();
@@ -281,10 +305,6 @@ function saveTradeLog() {
 loadPersistedState();
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Cache for DexScreener token-profiles (rate-limited endpoint — refresh at most every 60s)
-const DEX_PROFILES_CACHE_MS = Number(process.env.DEX_PROFILES_CACHE_MS || 60_000);
-let dexProfilesCache = { addresses: [], fetchedAt: 0 };
-
 const walletState = {
   startUsd: STARTING_BALANCE_USD,
   cashUsd: STARTING_BALANCE_USD,
@@ -302,7 +322,7 @@ const botState = {
   totalSoldVolume: 0,
   realizedPnlPct: 0,
   dataMode: USE_REAL_DATA ? 'real' : 'simulated',
-  dataSource: USE_REAL_DATA ? 'pump.fun + DexScreener' : 'internal simulation',
+  dataSource: USE_REAL_DATA ? 'MEXC REST' : 'internal simulation',
   lastDataError: null,
   lastDiscordError: null,
 };
@@ -487,7 +507,7 @@ function buildReportEmbed(title, sinceMs = 0, dashboard = null, meta = null) {
       { name: '🎯 Win Rate', value: `${winRate}%`, inline: true },
       { name: '⬆️ Avg Win', value: formatUsd(avgWinUsd), inline: true },
       { name: '⬇️ Avg Loss', value: formatUsd(avgLossUsd), inline: true },
-      { name: '🔖 Blacklisted', value: String(Array.isArray(snapshot?.blacklist) ? snapshot.blacklist.length : blacklist.size), inline: true },
+      { name: '🔖 Reusable', value: String(snapshot?.trades?.length || 0), inline: true },
       { name: '🧭 Data Mode', value: String(snapshot?.bot?.dataMode || botState.dataMode), inline: true },
       { name: '⏱️ Last Scan', value: snapshot?.bot?.lastScanAt ? new Date(snapshot.bot.lastScanAt).toLocaleTimeString() : 'n/a', inline: true },
       { name: '🆔 Report ID', value: reportMeta.reportId, inline: true },
@@ -1106,6 +1126,7 @@ function summarizeCoin(coin) {
   const volume24 = Math.max(0, safeNumber(coin.buyVolume, 0) + safeNumber(coin.sellVolume, 0));
   const volLiqRatio = liquidityUsd > 0 ? volume24 / liquidityUsd : 0;
   const hasLiquidityData = liquidityUsd > 0;
+  const highCapRelaxed = coin.marketCap >= TRACK_HIGH_VALUE_MIN_MARKETCAP_USD || liquidityUsd >= (TRACK_HIGH_VALUE_MIN_LIQUIDITY_USD * 0.25);
   const recentWindow = prices.slice(-12);
   const recentPeak = recentWindow.length > 0 ? Math.max(...recentWindow) : lastPrice;
   const drawdownPct = recentPeak > 0 ? ((recentPeak - lastPrice) / recentPeak) * 100 : 0;
@@ -1122,22 +1143,28 @@ function summarizeCoin(coin) {
     && drawdownPct <= NEW_DISCOVERY_MAX_DRAWDOWN_PCT
     && pc.m5 >= NEW_DISCOVERY_MIN_M5_PCT;
   const entryQuality = {
-    drawdownOk: drawdownPct <= MAX_ENTRY_DRAWDOWN_PCT,
-    shortMomentumOk: pc.m5 >= MIN_ENTRY_M5_PCT && pc.h1 >= MIN_ENTRY_H1_PCT,
-    flowOk: buySellRatio >= MIN_ENTRY_BUY_SELL_RATIO,
-    liquidityOk: hasLiquidityData ? liquidityUsd >= MIN_ENTRY_LIQUIDITY_USD : noLiqFallbackOk,
-    volumeLiqOk: hasLiquidityData ? (volLiqRatio >= MIN_VOL_LIQ_RATIO && volLiqRatio <= MAX_VOL_LIQ_RATIO) : true,
-    candlestickOk: candlestick.bullish,
+    drawdownOk: drawdownPct <= (highCapRelaxed ? MAX_ENTRY_DRAWDOWN_PCT * 1.6 : MAX_ENTRY_DRAWDOWN_PCT),
+    shortMomentumOk: pc.m5 >= (highCapRelaxed ? MIN_ENTRY_M5_PCT * 2 : MIN_ENTRY_M5_PCT)
+      && pc.h1 >= (highCapRelaxed ? MIN_ENTRY_H1_PCT * 1.5 : MIN_ENTRY_H1_PCT),
+    flowOk: buySellRatio >= (highCapRelaxed ? MIN_ENTRY_BUY_SELL_RATIO * 0.85 : MIN_ENTRY_BUY_SELL_RATIO),
+    liquidityOk: hasLiquidityData
+      ? liquidityUsd >= (highCapRelaxed ? MIN_ENTRY_LIQUIDITY_USD * 0.25 : MIN_ENTRY_LIQUIDITY_USD)
+      : noLiqFallbackOk,
+    volumeLiqOk: hasLiquidityData
+      ? (highCapRelaxed
+        ? (volLiqRatio >= MIN_VOL_LIQ_RATIO * 0.5 && volLiqRatio <= MAX_VOL_LIQ_RATIO * 2)
+        : (volLiqRatio >= MIN_VOL_LIQ_RATIO && volLiqRatio <= MAX_VOL_LIQ_RATIO))
+      : true,
+    candlestickOk: highCapRelaxed ? candlestick.score >= (MIN_CANDLE_BULLISH_SCORE * 0.7) : candlestick.bullish,
   };
 
-  const hasEnoughHistory = prices.length >= Math.max(4, MIN_HISTORY_DEPTH);
-  const marketCapOk = coin.marketCap >= 0 && coin.marketCap <= MAX_MARKETCAP_USD; // allow zero mcap on fresh coins
+  const hasEnoughHistory = prices.length >= (highCapRelaxed ? 4 : Math.max(4, MIN_HISTORY_DEPTH));
+  const marketCapOk = coin.marketCap >= 0 && coin.marketCap <= (highCapRelaxed ? MAX_MARKETCAP_USD * 8 : MAX_MARKETCAP_USD); // allow zero mcap on fresh coins
   const highValueTrackEligible =
     coinAgeMs <= TRACK_HIGH_VALUE_MAX_AGE_MS
-    && coin.marketCap >= TRACK_HIGH_VALUE_MIN_MARKETCAP_USD
-    && liquidityUsd >= TRACK_HIGH_VALUE_MIN_LIQUIDITY_USD;
+    && (coin.marketCap >= TRACK_HIGH_VALUE_MIN_MARKETCAP_USD * 0.35 || liquidityUsd >= TRACK_HIGH_VALUE_MIN_LIQUIDITY_USD * 0.25);
   // Only block on weak social if the coin actually HAS social data registered.
-  // Real DexScreener coins often have no socials, which should not count against them.
+  // Real exchange pairs often have no social metadata, which should not count against them.
   const hasSocialData = Boolean(coin.socials?.twitter || coin.socials?.telegram || coin.socials?.website);
   const socialOk = !hasSocialData || social.verdict === 'STRONG' || social.verdict === 'MEDIUM';
 
@@ -1150,7 +1177,7 @@ function summarizeCoin(coin) {
 
   const flowScore = clamp01((
     clamp01((buySellRatio - 0.8) / 1.2) * 0.5
-    + clamp01((coin.capitalFlow + 5_000) / 25_000) * 0.25
+    + clamp01(volume24 / Math.max(MIN_ENTRY_LIQUIDITY_USD * 2, 1)) * 0.25
     + clamp01(coin.activeUsers / 50) * 0.25
   ));
 
@@ -1177,7 +1204,7 @@ function summarizeCoin(coin) {
     + catalystScore * 0.1,
   );
   const entryScore = Number(entryScoreRaw.toFixed(3));
-  const scoreThresholdApplied = Math.max(0.5, OPTION_A_MIN_ENTRY_SCORE - (tvBoost ? OPTION_A_TV_SCORE_BONUS : 0));
+  const scoreThresholdApplied = Math.max(highCapRelaxed ? 0.42 : 0.5, OPTION_A_MIN_ENTRY_SCORE - (tvBoost ? OPTION_A_TV_SCORE_BONUS : 0) - (highCapRelaxed ? 0.08 : 0));
 
   const strategyHardGatesOk =
     marketCapOk
@@ -1185,15 +1212,14 @@ function summarizeCoin(coin) {
     && entryQuality.liquidityOk
     && entryQuality.flowOk
     && entryQuality.shortMomentumOk
-    && hasEnoughHistory
-    && coinAgeMs <= OPTION_A_MAX_COIN_AGE_MS;
+    && hasEnoughHistory;
 
   const entryQualified =
     strategyHardGatesOk
     && entryScore >= scoreThresholdApplied
-    && momentumScore >= OPTION_A_MIN_MOMENTUM_SCORE
-    && flowScore >= OPTION_A_MIN_FLOW_SCORE
-    && riskScore >= OPTION_A_MIN_RISK_SCORE;
+    && momentumScore >= (highCapRelaxed ? OPTION_A_MIN_MOMENTUM_SCORE * 0.85 : OPTION_A_MIN_MOMENTUM_SCORE)
+    && flowScore >= (highCapRelaxed ? OPTION_A_MIN_FLOW_SCORE * 0.85 : OPTION_A_MIN_FLOW_SCORE)
+    && riskScore >= (highCapRelaxed ? OPTION_A_MIN_RISK_SCORE * 0.9 : OPTION_A_MIN_RISK_SCORE);
 
   const canBuy = entryQualified;
   const buyReason = canBuy
@@ -1219,7 +1245,6 @@ function summarizeCoin(coin) {
     else if (!entryQuality.candlestickOk) skipReason = `candlestick weak (${candlestick.pattern}, score ${candlestick.score})`;
     else if (!socialOk) skipReason = `social ${social.verdict} (with data)`;
     else if (!hasEnoughHistory) skipReason = `needs ${Math.max(4, MIN_HISTORY_DEPTH)} pts (have ${prices.length})`;
-    else if (coinAgeMs > OPTION_A_MAX_COIN_AGE_MS) skipReason = `coin too old (${Math.round(coinAgeMs / 60000)}m)`;
     else if (entryScore < scoreThresholdApplied) skipReason = `entry score ${entryScore.toFixed(2)} < ${scoreThresholdApplied.toFixed(2)}`;
   }
 
@@ -1234,7 +1259,10 @@ function summarizeCoin(coin) {
     price: Number(lastPrice.toFixed(10)),
     marketCap: Math.round(coin.marketCap),
     liquidityUsd: Math.round(liquidityUsd),
-    capitalFlow: Math.round(coin.capitalFlow),
+    // Backward-compatibility: older frontends still render "CAP FLOW".
+    // Return pair price in these fields so legacy UIs show a useful value.
+    capitalFlow: Number(lastPrice.toFixed(10)),
+    capitalFlowUsd: Number(lastPrice.toFixed(10)),
     activeUsers: Math.round(coin.activeUsers),
     buyVolume: Math.round(coin.buyVolume),
     sellVolume: Math.round(coin.sellVolume),
@@ -1354,7 +1382,6 @@ function summarizeCoin(coin) {
         minMomentumScore: OPTION_A_MIN_MOMENTUM_SCORE,
         minFlowScore: OPTION_A_MIN_FLOW_SCORE,
         minRiskScore: OPTION_A_MIN_RISK_SCORE,
-        maxCoinAgeMs: OPTION_A_MAX_COIN_AGE_MS,
       },
     },
     canBuy,
@@ -1380,6 +1407,7 @@ function getWalletSnapshot() {
     realizedPnlUsd: Number(walletState.realizedPnlUsd.toFixed(2)),
     totalReturnUsd: Number(totalReturnUsd.toFixed(2)),
     totalReturnPct: Number(totalReturnPct.toFixed(2)),
+    leverageMultiplier: getLeverageMultiplier(),
     positions: positions.map((position) => ({
       symbol: position.symbol,
       tokenAddress: position.tokenAddress,
@@ -1391,8 +1419,47 @@ function getWalletSnapshot() {
       currentValueUsd: Number(position.currentValueUsd.toFixed(2)),
       unrealizedPnlUsd: Number(position.unrealizedPnlUsd.toFixed(2)),
       unrealizedPnlPct: Number(position.unrealizedPnlPct.toFixed(2)),
+      rawPnlPct: Number((position.rawPnlPct || 0).toFixed(2)),
+      leverageMultiplier: Number(position.leverageMultiplier || getLeverageMultiplier()),
       boughtAt: position.boughtAt,
     })),
+  };
+}
+
+function getLeverageMultiplier() {
+  return Number.isFinite(LEVERAGE_MULTIPLIER) && LEVERAGE_MULTIPLIER > 0
+    ? LEVERAGE_MULTIPLIER
+    : 1;
+}
+
+function calcRawPnlPct(buyPrice, currentPrice) {
+  if (!Number.isFinite(buyPrice) || buyPrice <= 0) return 0;
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0) return 0;
+  return ((currentPrice - buyPrice) / buyPrice) * 100;
+}
+
+function calcLeveragedPnlPct(rawPnlPct, leverageMultiplier = getLeverageMultiplier()) {
+  const leveraged = rawPnlPct * leverageMultiplier;
+  // Futures cannot lose beyond posted margin in this paper model.
+  return Math.max(-100, leveraged);
+}
+
+function markPositionWithLeverage(position, currentPrice) {
+  const peakPrice = Math.max(position.peakPrice ?? position.buyPrice, currentPrice);
+  const rawPnlPct = calcRawPnlPct(position.buyPrice, currentPrice);
+  const leverageMultiplier = Number(position.leverageMultiplier || getLeverageMultiplier());
+  const leveragedPnlPct = calcLeveragedPnlPct(rawPnlPct, leverageMultiplier);
+  const unrealizedPnlUsd = position.investedUsd * (leveragedPnlPct / 100);
+  const currentValueUsd = Math.max(0, position.investedUsd + unrealizedPnlUsd);
+
+  return {
+    currentPrice,
+    peakPrice,
+    rawPnlPct,
+    leveragedPnlPct,
+    unrealizedPnlUsd,
+    currentValueUsd,
+    leverageMultiplier,
   };
 }
 
@@ -1400,18 +1467,17 @@ function updateOpenPositionMarks() {
   for (const [tokenAddress, position] of walletState.openPositions.entries()) {
     const coin = marketState.get(tokenAddress);
     const currentPrice = coin?.history?.[coin.history.length - 1] || position.buyPrice;
-    const peakPrice = Math.max(position.peakPrice ?? position.buyPrice, currentPrice);
-    const currentValueUsd = position.qty * currentPrice;
-    const unrealizedPnlUsd = currentValueUsd - position.investedUsd;
-    const unrealizedPnlPct = position.investedUsd > 0 ? (unrealizedPnlUsd / position.investedUsd) * 100 : 0;
+    const mark = markPositionWithLeverage(position, currentPrice);
 
     walletState.openPositions.set(tokenAddress, {
       ...position,
-      currentPrice,
-      peakPrice,
-      currentValueUsd,
-      unrealizedPnlUsd,
-      unrealizedPnlPct,
+      currentPrice: mark.currentPrice,
+      peakPrice: mark.peakPrice,
+      currentValueUsd: mark.currentValueUsd,
+      unrealizedPnlUsd: mark.unrealizedPnlUsd,
+      unrealizedPnlPct: mark.leveragedPnlPct,
+      rawPnlPct: mark.rawPnlPct,
+      leverageMultiplier: mark.leverageMultiplier,
     });
   }
 }
@@ -1449,6 +1515,8 @@ function executeBuy(summary) {
     currentValueUsd: sizing.investedUsd,
     unrealizedPnlUsd: 0,
     unrealizedPnlPct: 0,
+    rawPnlPct: 0,
+    leverageMultiplier: getLeverageMultiplier(),
     boughtAt: Date.now(),
   };
 
@@ -1460,6 +1528,7 @@ function executeBuy(summary) {
     qty: sizing.qty,
     buyPrice: summary.price,
     investedUsd: sizing.investedUsd,
+    leverageMultiplier: position.leverageMultiplier,
     boughtAt: position.boughtAt,
   };
 
@@ -1468,6 +1537,10 @@ function executeBuy(summary) {
 }
 
 function entryExecutionGuard(summary) {
+  if (!ENTRY_GUARD_ENABLED) {
+    return { ok: true, reason: 'entry-guard-disabled' };
+  }
+
   const prices = Array.isArray(summary.priceSeries) ? summary.priceSeries : [];
   const n = prices.length;
 
@@ -1537,13 +1610,9 @@ function entryExecutionGuard(summary) {
 function smartSellSignal(coin, openPosition, currentPrice, heldMs) {
   const prices = coin?.history || [];
   const indicators = analyzeIndicators(prices);
-  const pnlPct = openPosition.buyPrice > 0
-    ? ((currentPrice - openPosition.buyPrice) / openPosition.buyPrice) * 100
-    : 0;
+  const pnlPct = calcLeveragedPnlPct(calcRawPnlPct(openPosition.buyPrice, currentPrice), Number(openPosition.leverageMultiplier || getLeverageMultiplier()));
   const peakPrice = openPosition.peakPrice ?? openPosition.buyPrice;
-  const peakGainPct = openPosition.buyPrice > 0
-    ? ((peakPrice - openPosition.buyPrice) / openPosition.buyPrice) * 100
-    : 0;
+  const peakGainPct = calcLeveragedPnlPct(calcRawPnlPct(openPosition.buyPrice, peakPrice), Number(openPosition.leverageMultiplier || getLeverageMultiplier()));
 
   // Deterministic exits first so positions cannot get stuck open forever.
   if (pnlPct >= strategyState.hardTakeProfitPct) {
@@ -1713,7 +1782,8 @@ function maybeExitPosition(summary, state) {
     return null;
   }
 
-  const pnlPct = ((summary.price - openPosition.buyPrice) / openPosition.buyPrice) * 100;
+  const rawPnlPct = calcRawPnlPct(openPosition.buyPrice, summary.price);
+  const pnlPct = calcLeveragedPnlPct(rawPnlPct, Number(openPosition.leverageMultiplier || getLeverageMultiplier()));
   const heldMs = Date.now() - openPosition.boughtAt;
   const oldEnough = heldMs >= MIN_HOLD_MS;
   const inPostBuyProtection = heldMs <= POST_BUY_PROTECTION_MS;
@@ -1724,7 +1794,10 @@ function maybeExitPosition(summary, state) {
 
   // Trailing stop: once peak gain >= TRAIL_ACTIVATE_PCT, trail from peak by TRAIL_STOP_PCT
   const peakPrice = openPosition.peakPrice ?? openPosition.buyPrice;
-  const peakGainPct = ((peakPrice - openPosition.buyPrice) / openPosition.buyPrice) * 100;
+  const peakGainPct = calcLeveragedPnlPct(
+    calcRawPnlPct(openPosition.buyPrice, peakPrice),
+    Number(openPosition.leverageMultiplier || getLeverageMultiplier()),
+  );
   const trailActive = peakGainPct >= strategyState.trailActivatePct;
   const trailPrice = peakPrice * (1 - strategyState.trailStopPct / 100);
   const hitTrail = trailActive && summary.price <= trailPrice && (!strategyState.profitOnlyMode || pnlPct > 0);
@@ -1752,8 +1825,9 @@ function maybeExitPosition(summary, state) {
     : emergencyDump ? 'post-buy-emergency-stop'
     : 'trend-break';
 
-  const proceedsUsd = openPosition.qty * summary.price;
-  const pnlUsd = proceedsUsd - openPosition.investedUsd;
+  const finalMark = markPositionWithLeverage(openPosition, summary.price);
+  const proceedsUsd = finalMark.currentValueUsd;
+  const pnlUsd = finalMark.unrealizedPnlUsd;
 
   walletState.cashUsd += proceedsUsd;
   walletState.realizedPnlUsd += pnlUsd;
@@ -1770,6 +1844,8 @@ function maybeExitPosition(summary, state) {
     proceedsUsd,
     pnlUsd: Number(pnlUsd.toFixed(2)),
     pnlPct: Number(pnlPct.toFixed(2)),
+    rawPnlPct: Number(rawPnlPct.toFixed(2)),
+    leverageMultiplier: Number(openPosition.leverageMultiplier || getLeverageMultiplier()),
     boughtAt: openPosition.boughtAt,
     soldAt: Date.now(),
     heldMs: Date.now() - openPosition.boughtAt,
@@ -1778,10 +1854,6 @@ function maybeExitPosition(summary, state) {
 
   tradeLog.unshift(trade);
 
-  if (trade.pnlUsd > 0) {
-    blacklist.add(summary.symbol);
-    saveBlacklist();
-  }
   saveTradeLog();
 
   notifySell(trade);
@@ -1882,41 +1954,140 @@ async function fetchJson(url) {
     const error = new Error(`Failed ${response.status} for ${url}`);
     error.status = response.status;
     error.url = url;
+    const retryAfterHeader = response.headers.get('retry-after');
+    if (retryAfterHeader) {
+      const asSeconds = Number(retryAfterHeader);
+      if (Number.isFinite(asSeconds) && asSeconds > 0) {
+        error.retryAfterMs = Math.floor(asSeconds * 1000);
+      }
+    }
     throw error;
   }
 
   return response.json();
 }
 
-async function fetchPumpCoinsWithFallback() {
-  const endpoints = [
-    'https://frontend-api.pump.fun/coins?offset=0&limit=40&sort=created_timestamp&order=DESC&includeNsfw=false',
-    'https://frontend-api-v3.pump.fun/coins?offset=0&limit=40&sort=created_timestamp&order=DESC&includeNsfw=false',
-  ];
+function prioritizeMexcHosts() {
+  if (!lastMexcSuccessHost) return [...ACTIVE_MEXC_BASE_URLS];
+  const preferred = ACTIVE_MEXC_BASE_URLS.filter((host) => host === lastMexcSuccessHost);
+  const others = ACTIVE_MEXC_BASE_URLS.filter((host) => host !== lastMexcSuccessHost);
+  return [...preferred, ...others];
+}
 
-  const errors = [];
-  let blockedBy403 = 0;
-  for (const endpoint of endpoints) {
+async function fetchMexcJson(path) {
+  const now = Date.now();
+  if (now < mexcCooldownUntil) {
+    const waitSeconds = Math.max(1, Math.ceil((mexcCooldownUntil - now) / 1000));
+    const cooldownError = new Error(`MEXC temporary cooldown active (${waitSeconds}s remaining)`);
+    cooldownError.status = 429;
+    throw cooldownError;
+  }
+
+  let lastError = null;
+  let saw403 = false;
+  let saw418or429 = false;
+
+  for (const baseUrl of prioritizeMexcHosts()) {
     try {
-      const payload = await fetchJson(endpoint);
-      if (Array.isArray(payload) && payload.length > 0) {
-        return {
-          coins: payload,
-          endpoint,
-          blockedBy403: false,
-        };
-      }
-
-      errors.push(`Empty payload from ${endpoint}`);
+      const payload = await fetchJson(`${baseUrl}${path}`);
+      lastMexcSuccessHost = baseUrl;
+      return {
+        payload,
+        endpoint: `${baseUrl}${path}`,
+      };
     } catch (error) {
-      if (error?.status === 403) blockedBy403 += 1;
-      errors.push(error instanceof Error ? error.message : `Unknown error for ${endpoint}`);
+      lastError = error;
+      const status = Number(error?.status || 0);
+      if (status === 403) saw403 = true;
+      if (status === 418 || status === 429) {
+        saw418or429 = true;
+        const retryAfterMs = Number(error?.retryAfterMs || 0);
+        const cooldownMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0
+          ? retryAfterMs
+          : 60_000;
+        mexcCooldownUntil = Math.max(mexcCooldownUntil, Date.now() + cooldownMs);
+      }
     }
   }
 
-  const fallbackError = new Error(errors.join(' | '));
-  fallbackError.blockedBy403 = blockedBy403 === endpoints.length;
-  throw fallbackError;
+  const finalError = new Error(lastError instanceof Error ? lastError.message : 'Unknown MEXC fetch error');
+  finalError.blockedBy403 = saw403;
+  finalError.blockedByRateLimit = saw418or429;
+  throw finalError;
+}
+
+async function fetchMexcPairsWithFallback() {
+  // Discover as many MEXC spot pairs as possible using public REST market data.
+  // No hardcoded search list: use MEXC exchangeInfo as the discovery source.
+
+  try {
+    const [exchangeInfoResult, tickerDataResult] = await Promise.all([
+      fetchMexcJson('/api/v3/exchangeInfo'),
+      fetchMexcJson('/api/v3/ticker/24hr'),
+    ]);
+    const exchangeInfo = exchangeInfoResult.payload;
+    const tickerData = tickerDataResult.payload;
+
+    const symbols = Array.isArray(exchangeInfo?.symbols) ? exchangeInfo.symbols : [];
+    const tickers = Array.isArray(tickerData) ? tickerData : [];
+
+    const tickerMap = new Map();
+    for (const ticker of tickers) {
+      const symbol = ticker?.symbol;
+      if (typeof symbol === 'string' && symbol.length > 0) {
+        tickerMap.set(symbol, ticker);
+      }
+    }
+
+    const discoveredCoins = symbols
+      .filter((item) => isActiveTradingStatus(item?.status))
+      .map((item) => {
+        const parsed = parseMexcBaseQuote(item?.symbol, item?.baseAsset, item?.quoteAsset);
+        if (parsed.quoteAsset !== 'USDT') return null;
+        if (!parsed.symbol || !parsed.baseAsset) return null;
+        if (isStableAssetSymbol(parsed.baseAsset) || isStableAssetSymbol(parsed.symbol)) return null;
+
+        const ticker = tickerMap.get(parsed.symbol);
+        if (!ticker) return null;
+
+        const price = Number(ticker?.lastPrice || 0);
+        if (!Number.isFinite(price) || price <= 0) return null;
+
+        return {
+          symbol: parsed.baseAsset,
+          name: parsed.baseAsset,
+          instrumentName: parsed.symbol,
+          price: ticker?.lastPrice,
+          volume24h: ticker?.volume,
+          volumeUsd24h: ticker?.quoteVolume,
+          takerBuyQuoteVolume: ticker?.takerBuyQuoteVolume,
+          takerBuyBaseVolume: ticker?.takerBuyBaseVolume,
+          tradeCount: ticker?.count,
+          capitalFlowUsd: safeNumber(ticker?.takerBuyQuoteVolume, 0) - (safeNumber(ticker?.quoteVolume, 0) - safeNumber(ticker?.takerBuyQuoteVolume, 0)),
+          change24h: ticker?.priceChangePercent,
+          marketCap: Number(ticker?.quoteVolume || 0),
+          liquidityUsd: Number(ticker?.quoteVolume || 0),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Number(b.volumeUsd24h || 0) - Number(a.volumeUsd24h || 0));
+
+    if (discoveredCoins.length === 0) {
+      throw new Error('No MEXC USDT pairs found');
+    }
+
+    return {
+      coins: discoveredCoins,
+      endpoint: exchangeInfoResult.endpoint,
+      blockedBy403: false,
+      blockedByRateLimit: false,
+    };
+  } catch (error) {
+    const fallbackError = new Error(error instanceof Error ? error.message : 'Unknown error fetching MEXC data');
+    fallbackError.blockedBy403 = Boolean(error?.blockedBy403) || error?.status === 403;
+    fallbackError.blockedByRateLimit = Boolean(error?.blockedByRateLimit) || error?.status === 418 || error?.status === 429;
+    throw fallbackError;
+  }
 }
 
 function chooseBestPair(pairs) {
@@ -1944,6 +2115,70 @@ function extractSocials(pair) {
 function safeNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isActiveTradingStatus(status) {
+  const normalized = String(status ?? '').trim().toUpperCase();
+  return normalized === 'TRADING'
+    || normalized === 'ENABLED'
+    || normalized === '1'
+    || normalized === 'TRUE';
+}
+
+function parseMexcBaseQuote(symbol, baseAsset, quoteAsset) {
+  const normalizedSymbol = String(symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const normalizedBase = String(baseAsset || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const normalizedQuote = String(quoteAsset || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+  if (normalizedBase && normalizedQuote) {
+    return {
+      symbol: normalizedSymbol,
+      baseAsset: normalizedBase,
+      quoteAsset: normalizedQuote,
+    };
+  }
+
+  const knownQuotes = ['USDT', 'USDC', 'USD1', 'BTC', 'ETH'];
+  for (const quote of knownQuotes) {
+    if (normalizedSymbol.endsWith(quote) && normalizedSymbol.length > quote.length) {
+      return {
+        symbol: normalizedSymbol,
+        baseAsset: normalizedSymbol.slice(0, -quote.length),
+        quoteAsset: quote,
+      };
+    }
+  }
+
+  return {
+    symbol: normalizedSymbol,
+    baseAsset: normalizedBase || normalizedSymbol,
+    quoteAsset: normalizedQuote,
+  };
+}
+
+function isStableAssetSymbol(symbol) {
+  const normalized = String(symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return STABLE_ASSET_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(prefix));
+}
+
+function pruneStableCoinsFromState() {
+  for (const [address, coin] of marketState.entries()) {
+    if (isStableAssetSymbol(coin?.symbol) || isStableAssetSymbol(address)) {
+      marketState.delete(address);
+    }
+  }
+
+  for (const [symbol, state] of trackedCoins.entries()) {
+    if (isStableAssetSymbol(symbol) || isStableAssetSymbol(state?.snapshot?.symbol) || isStableAssetSymbol(state?.snapshot?.address)) {
+      trackedCoins.delete(symbol);
+    }
+  }
+
+  for (const [symbol, state] of skippedCoins.entries()) {
+    if (isStableAssetSymbol(symbol) || isStableAssetSymbol(state?.snapshot?.symbol) || isStableAssetSymbol(state?.snapshot?.address)) {
+      skippedCoins.delete(symbol);
+    }
+  }
 }
 
 // --- Map size-cap eviction helpers ---
@@ -2011,12 +2246,17 @@ function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct,
   const txnsH24 = pair?.txns?.h24 || {};
   const buys = safeNumber(txnsH24?.buys, 0);
   const sells = safeNumber(txnsH24?.sells, 0);
-  const totalTx = Math.max(1, buys + sells);
   const volumeH24 = safeNumber(pair?.volume?.h24, 0);
-  const buyVolume = volumeH24 * (buys / totalTx);
-  const sellVolume = volumeH24 * (sells / totalTx);
+  const takerBuyQuoteVolume = safeNumber(pair?.takerBuyQuoteVolume, volumeH24 * 0.5);
+  const buyVolume = Math.max(0, Math.min(volumeH24, takerBuyQuoteVolume));
+  const sellVolume = Math.max(0, volumeH24 - buyVolume);
   const marketCap = safeNumber(pair?.marketCap, safeNumber(pair?.fdv, 0));
   const liquidityUsd = safeNumber(pair?.liquidity?.usd, 0);
+  const capitalFlow = safeNumber(
+    pair?.capitalFlowUsd,
+    buyVolume - sellVolume,
+  );
+  const activeUsers = Math.max(1, Math.round(safeNumber(pair?.activeUsers, safeNumber(txnsH24?.count, buys + sells))));
 
   const priceChange = {
     m5:  safeNumber(pair?.priceChange?.m5,  0),
@@ -2040,12 +2280,12 @@ function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct,
     priceChange,
     socials: extractSocials(pair),
     creatorOwnershipPct,
-    activeUsers: Math.max(1, Math.round(buys + sells)),
+    activeUsers,
     buyVolume,
     sellVolume,
     marketCap,
     liquidityUsd,
-    capitalFlow: buyVolume - sellVolume,
+    capitalFlow,
     source: 'real',
   });
 
@@ -2053,151 +2293,82 @@ function upsertRealCoin({ address, symbol, name, createdAt, creatorOwnershipPct,
   return true;
 }
 
-async function ingestRealMarketDataViaPumpFun() {
-  const pumpResult = await fetchPumpCoinsWithFallback();
-  const coins = pumpResult.coins;
+async function ingestRealMarketDataViaMexc() {
+  const mexcResult = await fetchMexcPairsWithFallback();
+  const coins = mexcResult.coins;
 
   if (!Array.isArray(coins) || coins.length === 0) {
-    throw new Error('Pump.fun returned empty coin list');
+    throw new Error('MEXC exchange returned empty pair list');
   }
 
-  const mints = coins
-    .map((coin) => coin?.mint || coin?.address)
-    .filter((mint) => typeof mint === 'string' && mint.length > 20)
-    .slice(0, 25);
+  // Extract symbols from MEXC market data only
+  const symbols = coins
+    .map((coin) => coin?.symbol)
+    .filter((symbol) => typeof symbol === 'string' && symbol.length > 0)
+    .slice(0, 250);
 
-  if (mints.length === 0) {
-    throw new Error('No valid token mints found from pump.fun');
+  if (symbols.length === 0) {
+    throw new Error('No valid MEXC symbols extracted');
   }
 
-  const dexData = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mints.join(',')}`);
-  const pairList = Array.isArray(dexData?.pairs) ? dexData.pairs : [];
-  if (pairList.length === 0) {
-    throw new Error('DexScreener returned no matching Solana pairs');
-  }
-
-  const pairMap = new Map();
-  for (const pair of pairList) {
-    const tokenAddress = pair?.baseToken?.address;
-    if (!tokenAddress) continue;
-
-    const existing = pairMap.get(tokenAddress) || [];
-    existing.push(pair);
-    pairMap.set(tokenAddress, existing);
-  }
+  // Keep ingestion bounded to reduce CPU spikes and map churn that can cause
+  // tracked rows to appear/disappear under heavy discovery volume.
+  const ingestLimit = Math.max(250, Math.min(MAX_MARKET_STATE_SIZE, 600));
+  const ingestCoins = coins.slice(0, ingestLimit);
 
   let inserted = 0;
-  for (const coin of coins) {
-    const address = coin?.mint || coin?.address;
-    if (!address) continue;
-
-    const bestPair = chooseBestPair(pairMap.get(address));
-    if (!bestPair) continue;
-
+  for (const coin of ingestCoins) {
+    const symbol = (coin?.symbol || 'UNK').toUpperCase();
+    const existing = marketState.get(symbol);
     const ok = upsertRealCoin({
-      address,
-      symbol: (bestPair?.baseToken?.symbol || coin?.symbol || 'UNK').toUpperCase(),
-      name: bestPair?.baseToken?.name || coin?.name || 'Unknown',
-      createdAt: safeNumber(coin?.created_timestamp, Date.now()),
-      creatorOwnershipPct: safeNumber(
-        coin?.creator_token_percentage ?? coin?.creatorPercent ?? coin?.creator_ownership,
-        rand(3, 18),
-      ),
-      pair: bestPair,
-    });
-
-    if (ok) inserted += 1;
-  }
-
-  if (inserted === 0) {
-    throw new Error('Pump.fun + DexScreener produced zero usable tokens');
-  }
-
-  return pumpResult.endpoint;
-}
-
-async function ingestRealMarketDataViaDexOnly() {
-  const now = Date.now();
-  let solanaAddresses;
-
-  if (dexProfilesCache.addresses.length > 0 && now - dexProfilesCache.fetchedAt < DEX_PROFILES_CACHE_MS) {
-    // Reuse cached addresses — avoid hammering the rate-limited profiles endpoint
-    solanaAddresses = dexProfilesCache.addresses;
-  } else {
-    const tokenProfiles = await fetchJson('https://api.dexscreener.com/token-profiles/latest/v1');
-    const profiles = Array.isArray(tokenProfiles) ? tokenProfiles : [];
-
-    solanaAddresses = profiles
-      .filter((item) => item?.chainId === 'solana')
-      .map((item) => item?.tokenAddress)
-      .filter((address) => typeof address === 'string' && address.length > 20)
-      .slice(0, 25);
-
-    if (solanaAddresses.length === 0) {
-      throw new Error('Dex token profiles contained no Solana token addresses');
-    }
-
-    dexProfilesCache = { addresses: solanaAddresses, fetchedAt: now };
-  }
-
-  if (solanaAddresses.length === 0) {
-    throw new Error('Dex token profiles contained no Solana token addresses');
-  }
-
-  const dexData = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${solanaAddresses.join(',')}`);
-  const pairList = Array.isArray(dexData?.pairs) ? dexData.pairs : [];
-  if (pairList.length === 0) {
-    throw new Error('Dex-only path returned no token pairs');
-  }
-
-  const grouped = new Map();
-  for (const pair of pairList) {
-    const tokenAddress = pair?.baseToken?.address;
-    if (!tokenAddress) continue;
-
-    const current = grouped.get(tokenAddress) || [];
-    current.push(pair);
-    grouped.set(tokenAddress, current);
-  }
-
-  let inserted = 0;
-  for (const address of solanaAddresses) {
-    const bestPair = chooseBestPair(grouped.get(address));
-    if (!bestPair) continue;
-
-    const ok = upsertRealCoin({
-      address,
-      symbol: (bestPair?.baseToken?.symbol || 'UNK').toUpperCase(),
-      name: bestPair?.baseToken?.name || 'Unknown',
-      createdAt: Date.now(),
+      address: symbol,
+      symbol,
+      name: coin?.name || symbol,
+      createdAt: existing?.createdAt ?? Date.now(),
       creatorOwnershipPct: rand(3, 18),
-      pair: bestPair,
+      pair: {
+        priceUsd: coin?.price,
+        marketCap: coin?.marketCap,
+        liquidity: { usd: coin?.liquidityUsd },
+        volume: { h24: coin?.volumeUsd24h },
+        priceChange: { h24: coin?.change24h },
+        txns: { h24: { buys: 1, sells: 1, count: Number(coin?.tradeCount || 2) } },
+        takerBuyQuoteVolume: safeNumber(coin?.takerBuyQuoteVolume, Number(coin?.volumeUsd24h || 0) * 0.5),
+        capitalFlowUsd: safeNumber(coin?.capitalFlowUsd, 0),
+        activeUsers: safeNumber(coin?.tradeCount, 1),
+        baseToken: { address: symbol, symbol, name: coin?.name || symbol },
+        chainId: 'mexc',
+      },
     });
 
     if (ok) inserted += 1;
   }
 
   if (inserted === 0) {
-    throw new Error('Dex-only path produced zero usable tokens');
+    throw new Error('MEXC produced zero usable pairs');
   }
+
+  return mexcResult.endpoint;
 }
 
 async function ingestRealMarketData() {
   try {
-    const endpointUsed = await ingestRealMarketDataViaPumpFun();
+    const endpointUsed = await ingestRealMarketDataViaMexc();
     return {
-      source: `pump.fun + DexScreener (${new URL(endpointUsed).host})`,
+      source: `MEXC REST (${new URL(endpointUsed).host})`,
       warning: null,
     };
-  } catch (pumpError) {
-    await ingestRealMarketDataViaDexOnly();
-    const blockedBy403 = Boolean(pumpError?.blockedBy403);
+  } catch (mexcError) {
+    const blockedBy403 = Boolean(mexcError?.blockedBy403);
+    const blockedByRateLimit = Boolean(mexcError?.blockedByRateLimit);
     return {
-      source: 'DexScreener-only (pump.fun blocked)',
+      source: 'MEXC discovery paused',
       warning: blockedBy403
-        ? 'Pump.fun blocked with HTTP 403. Running in DexScreener-only discovery mode.'
-        : `Pump.fun path failed, switched to Dex-only: ${
-            pumpError instanceof Error ? pumpError.message : 'unknown error'
+        ? 'MEXC blocked with HTTP 403.'
+        : blockedByRateLimit
+          ? 'MEXC rate-limited with HTTP 418/429. Cooling down automatically before retrying.'
+        : `MEXC path failed: ${
+            mexcError instanceof Error ? mexcError.message : 'unknown error'
           }`,
     };
   }
@@ -2231,6 +2402,7 @@ async function refreshMarketData() {
     botState.dataMode = 'real';
     botState.dataSource = realDataResult.source;
     botState.lastDataError = realDataResult.warning;
+    pruneStableCoinsFromState();
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Unknown data fetch error';
     botState.lastDataError = errMsg;
@@ -2261,31 +2433,48 @@ async function refreshOpenPositionPrices() {
   if (openAddresses.length === 0) return;
 
   try {
-    const dexData = await fetchJson(
-      `https://api.dexscreener.com/latest/dex/tokens/${openAddresses.join(',')}`,
-    );
-    const pairs = Array.isArray(dexData?.pairs) ? dexData.pairs : [];
+    const tickerMap = new Map();
 
-    const grouped = new Map();
-    for (const pair of pairs) {
-      const addr = pair?.baseToken?.address;
-      if (!addr) continue;
-      const bucket = grouped.get(addr) || [];
-      bucket.push(pair);
-      grouped.set(addr, bucket);
+    for (const address of openAddresses) {
+      const symbol = `${String(address || '').toUpperCase()}USDT`;
+      if (!/^[A-Z0-9]{4,25}USDT$/.test(symbol)) continue;
+
+      const tickerResult = await fetchMexcJson(`/api/v3/ticker/24hr?symbol=${symbol}`);
+      const ticker = tickerResult.payload;
+      if (ticker && typeof ticker?.symbol === 'string') {
+        tickerMap.set(ticker.symbol.replace(/USDT$/i, ''), ticker);
+      }
     }
 
     for (const address of openAddresses) {
-      const bestPair = chooseBestPair(grouped.get(address));
-      if (!bestPair) continue;
+      const ticker = tickerMap.get(address);
+      if (!ticker) continue;
+
       const existing = marketState.get(address);
+      const lastPrice = Number(ticker?.lastPrice || 0);
+      if (!Number.isFinite(lastPrice) || lastPrice <= 0) continue;
+
       upsertRealCoin({
         address,
-        symbol: (bestPair?.baseToken?.symbol || 'UNK').toUpperCase(),
-        name: bestPair?.baseToken?.name || 'Unknown',
+        symbol: address.toUpperCase(),
+        name: address.toUpperCase(),
         createdAt: existing?.createdAt ?? Date.now(),
         creatorOwnershipPct: existing?.creatorOwnershipPct ?? rand(3, 18),
-        pair: bestPair,
+        pair: {
+          priceUsd: ticker?.lastPrice,
+          marketCap: Number(ticker?.quoteVolume || 0),
+          liquidity: { usd: Number(ticker?.quoteVolume || 0) },
+          volume: { h24: Number(ticker?.quoteVolume || 0) },
+          priceChange: {
+            m5: 0,
+            h1: Number(ticker?.priceChangePercent || 0),
+            h6: Number(ticker?.priceChangePercent || 0),
+            h24: Number(ticker?.priceChangePercent || 0),
+          },
+          txns: { h24: { buys: 1, sells: 1 } },
+          baseToken: { address, symbol: address.toUpperCase(), name: address.toUpperCase() },
+          chainId: 'mexc',
+        },
       });
     }
   } catch {
@@ -2303,13 +2492,17 @@ function checkOpenPositionExits() {
     const currentPrice = coin?.history?.[coin.history.length - 1] || position.currentPrice || position.buyPrice;
     if (!currentPrice || currentPrice <= 0) continue;
 
-    const pnlPct = ((currentPrice - position.buyPrice) / position.buyPrice) * 100;
+    const rawPnlPct = calcRawPnlPct(position.buyPrice, currentPrice);
+    const pnlPct = calcLeveragedPnlPct(rawPnlPct, Number(position.leverageMultiplier || getLeverageMultiplier()));
     const heldMs = Date.now() - position.boughtAt;
     const inPostBuyProtection = heldMs <= POST_BUY_PROTECTION_MS;
     const oldEnough = heldMs >= MIN_HOLD_MS;
 
     const peakPrice = Math.max(position.peakPrice ?? position.buyPrice, currentPrice);
-    const peakGainPct = ((peakPrice - position.buyPrice) / position.buyPrice) * 100;
+    const peakGainPct = calcLeveragedPnlPct(
+      calcRawPnlPct(position.buyPrice, peakPrice),
+      Number(position.leverageMultiplier || getLeverageMultiplier()),
+    );
 
     // Run the same smart sell signal used in maybeExitPosition
     const smartSell = smartSellSignal(coin, { ...position, peakPrice }, currentPrice, heldMs);
@@ -2340,8 +2533,9 @@ function checkOpenPositionExits() {
       : emergencyDump ? 'post-buy-emergency-stop'
       : 'trend-break';
 
-    const proceedsUsd = position.qty * currentPrice;
-    const pnlUsd = proceedsUsd - position.investedUsd;
+    const finalMark = markPositionWithLeverage(position, currentPrice);
+    const proceedsUsd = finalMark.currentValueUsd;
+    const pnlUsd = finalMark.unrealizedPnlUsd;
 
     walletState.cashUsd += proceedsUsd;
     walletState.realizedPnlUsd += pnlUsd;
@@ -2358,6 +2552,8 @@ function checkOpenPositionExits() {
       proceedsUsd,
       pnlUsd: Number(pnlUsd.toFixed(2)),
       pnlPct: Number(pnlPct.toFixed(2)),
+      rawPnlPct: Number(rawPnlPct.toFixed(2)),
+      leverageMultiplier: Number(position.leverageMultiplier || getLeverageMultiplier()),
       boughtAt: position.boughtAt,
       soldAt: Date.now(),
       heldMs,
@@ -2366,10 +2562,6 @@ function checkOpenPositionExits() {
 
     tradeLog.unshift(trade);
 
-    if (trade.pnlUsd > 0) {
-      blacklist.add(position.symbol);
-      saveBlacklist();
-    }
     saveTradeLog();
 
     notifySell(trade);
@@ -2377,9 +2569,9 @@ function checkOpenPositionExits() {
     // Sync trackedCoins state so scanAndTrack doesn't re-process this position
     const tracked = trackedCoins.get(position.symbol);
     if (tracked) {
-      tracked.status = 'sold';
+      tracked.status = 'watching';
       tracked.position = null;
-      tracked.sold = true;
+      tracked.lastSeenAt = Date.now();
     }
 
     updateRealizedPnlPct();
@@ -2389,7 +2581,12 @@ function checkOpenPositionExits() {
 // Lightweight price refresh — always running, no trading logic
 async function refreshPrices() {
   try {
-    await refreshMarketData();
+    const now = Date.now();
+    const shouldRefreshMarket = (now - lastMarketRefreshAt) >= MARKET_REFRESH_MS;
+    if (shouldRefreshMarket) {
+      await refreshMarketData();
+      lastMarketRefreshAt = now;
+    }
     if (USE_REAL_DATA && walletState.openPositions.size > 0) {
       await refreshOpenPositionPrices();
     }
@@ -2409,6 +2606,7 @@ async function scanAndTrack() {
   botState.scanInProgress = true;
   try {
     // Prices already fresh from background loop; just re-mark open positions
+    pruneStableCoinsFromState();
     updateOpenPositionMarks();
 
     botState.scans += 1;
@@ -2416,24 +2614,51 @@ async function scanAndTrack() {
 
     const summaries = [...marketState.values()].map((coin) => summarizeCoin(coin));
 
+    const rankedSummaries = [...summaries].sort((a, b) => {
+      const aPriority = (a.canBuy ? 3 : 0) + (a.trackHighValue24h ? 2 : 0);
+      const bPriority = (b.canBuy ? 3 : 0) + (b.trackHighValue24h ? 2 : 0);
+      if (bPriority !== aPriority) return bPriority - aPriority;
+      if (b.analysis.entryScore !== a.analysis.entryScore) {
+        return b.analysis.entryScore - a.analysis.entryScore;
+      }
+      if (b.liquidityUsd !== a.liquidityUsd) {
+        return b.liquidityUsd - a.liquidityUsd;
+      }
+      return b.marketCap - a.marketCap;
+    });
+
+    const trackUniverse = new Set(
+      rankedSummaries.slice(0, Math.max(10, TRACK_UNIVERSE_LIMIT)).map((summary) => summary.symbol),
+    );
+
+    for (const [symbol, state] of trackedCoins.entries()) {
+      if (state.position) {
+        trackUniverse.add(symbol);
+      }
+    }
+
     for (const summary of summaries) {
       const now = Date.now();
       const existing = trackedCoins.get(summary.symbol) || {
         status: 'watching',
         observedAt: Date.now(),
         position: null,
-        sold: false,
         buySignalStreak: 0,
       };
 
-      const shouldTrackByPolicy =
-        summary.analysis?.entryScore >= OPTION_A_TRACK_MIN_SCORE
-        || summary.canBuy
-        || trackedCoins.has(summary.symbol)
-        || summary.trackHighValue24h;
+      const alreadyTracked = trackedCoins.has(summary.symbol);
+      const shouldTrackByPolicy = alreadyTracked || (
+        trackUniverse.has(summary.symbol)
+        && (
+          summary.canBuy
+          || summary.trackHighValue24h
+          || safeNumber(summary?.analysis?.entryScore, 0) >= OPTION_A_TRACK_MIN_SCORE
+        )
+      );
 
-      // Tokens explicitly skipped by strategy are moved to a separate list and no longer tracked.
-      if (summary.skipReason && !existing.position && !summary.trackHighValue24h) {
+      // Tokens explicitly skipped by strategy are moved to a separate list only if
+      // they are not already part of trackedCoins. This avoids tracked-row flicker.
+      if (summary.skipReason && !existing.position && !summary.trackHighValue24h && !trackedCoins.has(summary.symbol)) {
         const previousSkip = skippedCoins.get(summary.symbol);
         skippedCoins.set(summary.symbol, {
           symbol: summary.symbol,
@@ -2444,8 +2669,9 @@ async function scanAndTrack() {
         });
       }
 
-      // Keep skipped list snapshots fresh for UI, but do not re-track them.
-      if (skippedCoins.has(summary.symbol) && summary.trackHighValue24h) {
+      // Keep skipped list snapshots fresh for UI, but never allow a tracked symbol
+      // to remain in skipped state.
+      if (skippedCoins.has(summary.symbol) && (summary.trackHighValue24h || trackedCoins.has(summary.symbol))) {
         skippedCoins.delete(summary.symbol);
       }
 
@@ -2458,10 +2684,6 @@ async function scanAndTrack() {
           // Still cooling down — keep snapshot frozen, do not update price or lastSeenAt.
           continue;
         }
-      }
-
-      if (blacklist.has(summary.symbol)) {
-        continue;
       }
 
       if (shouldTrackByPolicy) {
@@ -2481,11 +2703,9 @@ async function scanAndTrack() {
 
           const guard = entryExecutionGuard(summary);
           if (!guard.ok) {
-            // Reset streak so it must re-confirm next scan, but do NOT put into
-            // skippedCoins — the 3-min cooldown there would prevent any buy at all
-            // for fast-moving P1 coins.
-            existing.buySignalStreak = 0;
-            existing.status = 'watching';
+            // Keep streak/state stable so candidates do not get stuck in an endless
+            // re-confirm loop when entry guard is temporarily red.
+            existing.status = summary.canBuy ? 'ready' : 'watching';
             trackedCoins.set(summary.symbol, existing);
             continue;
           }
@@ -2500,12 +2720,12 @@ async function scanAndTrack() {
 
         const exitTrade = maybeExitPosition(summary, existing);
         if (exitTrade) {
-          existing.status = 'sold';
+          existing.status = summary.canBuy ? 'ready' : 'watching';
           existing.position = null;
-          existing.sold = true;
+          existing.lastSeenAt = now;
         }
 
-        if (!existing.position && !existing.sold) {
+        if (!existing.position) {
           existing.status = summary.canBuy ? 'ready' : 'watching';
         }
 
@@ -2513,28 +2733,38 @@ async function scanAndTrack() {
       }
     }
 
-    const now = Date.now();
-    for (const [symbol, state] of trackedCoins.entries()) {
-      if (state.sold) {
-        trackedCoins.delete(symbol);
-        continue;
-      }
+    if (trackedCoins.size === 0 && summaries.length > 0) {
+      const seedCandidates = summaries
+        .filter((summary) => Number(summary.liquidityUsd || 0) > 0 || Number(summary.marketCap || 0) > 0)
+        .sort((a, b) => {
+          const aScore = Number(a.liquidityUsd || 0) + Number(a.marketCap || 0);
+          const bScore = Number(b.liquidityUsd || 0) + Number(b.marketCap || 0);
+          return bScore - aScore;
+        })
+        .slice(0, 5);
 
-      // Prevent unbounded trackedCoins growth: expire stale non-position entries.
-      if (!state.position && now - (state.observedAt || now) >= TRACKED_TTL_MS) {
-        const previousSkip = skippedCoins.get(symbol);
-        skippedCoins.set(symbol, {
-          symbol,
-          reason: `tracked-timeout-${Math.round(TRACKED_TTL_MS / 60_000)}m`,
-          skippedAt: previousSkip?.skippedAt ?? now,
-          lastSeenAt: now,
-          snapshot: state.snapshot,
+      for (const summary of seedCandidates) {
+        trackedCoins.set(summary.symbol, {
+          status: summary.canBuy ? 'ready' : 'watching',
+          observedAt: Date.now(),
+          lastSeenAt: Date.now(),
+          position: null,
+          sold: false,
+          buySignalStreak: 0,
+          snapshot: summary,
         });
-        trackedCoins.delete(symbol);
       }
     }
 
-    // Hard size-cap eviction — runs after TTL cleanup so caps are always honoured.
+    const now = Date.now();
+    for (const [symbol, state] of trackedCoins.entries()) {
+      // Keep watchlist entries visible after exit; only the size cap can remove them.
+      if (!state.position) {
+        state.lastSeenAt = now;
+      }
+    }
+
+    // Hard size-cap eviction keeps the tracked list bounded without aging entries out early.
     evictTrackedCoins();
     evictSkippedCoins();
 
@@ -2547,6 +2777,7 @@ async function scanAndTrack() {
 
 function getDashboard() {
   // Ensure open position marks reflect the freshest known market prices.
+  pruneStableCoinsFromState();
   updateOpenPositionMarks();
 
   const activeTradingViewSignals = listActiveTradingViewSignals(20);
@@ -2576,7 +2807,8 @@ function getDashboard() {
   // Skipped coin snapshots are intentionally frozen — do not refresh from live market data.
   const skipped = [...skippedCoins.values()]
     .filter((item) => item.snapshot)
-    .sort((a, b) => b.skippedAt - a.skippedAt);
+    .sort((a, b) => b.skippedAt - a.skippedAt)
+    .slice(0, 300);
 
   return {
     bot: {
@@ -2610,7 +2842,7 @@ function getDashboard() {
     skipped,
     market,
     tradingViewSignals: activeTradingViewSignals,
-    blacklist: [...blacklist],
+    blacklist: [],
     trades: tradeLog.slice(0, 30),
   };
 }

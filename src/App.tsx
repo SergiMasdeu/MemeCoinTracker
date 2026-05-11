@@ -61,13 +61,11 @@ type CoinSnapshot = {
       minMomentumScore: number
       minFlowScore: number
       minRiskScore: number
-      maxCoinAgeMs: number
     }
   }
   canBuy: boolean
   buyReason: string | null
   skipReason: string | null
-  coinAgeMs: number
   trackHighValue24h: boolean
 }
 
@@ -275,24 +273,21 @@ function App() {
 
   const topCandidates = useMemo(() => {
     if (!data) return []
-    const trackedCandidates = (data.tracked ?? [])
+    return (data.tracked ?? [])
+      .filter((item) => item.status === 'ready' || item.status === 'bought')
       .map((item) => item.snapshot)
       .filter((coin) => coin.canBuy)
-
-    const seenAddresses = new Set(trackedCandidates.map((coin) => coin.address))
-    const marketFallback = (data.market ?? []).filter(
-      (coin) => coin.canBuy && !seenAddresses.has(coin.address),
-    )
-
-    return [...trackedCandidates, ...marketFallback]
       .sort((a, b) => {
         if (b.analysis.entryScore !== a.analysis.entryScore) {
           return b.analysis.entryScore - a.analysis.entryScore
         }
+        if (b.liquidityUsd !== a.liquidityUsd) {
+          return b.liquidityUsd - a.liquidityUsd
+        }
         return b.marketCap - a.marketCap
       })
       .slice(0, 8)
-  }, [data?.tracked, data?.market])
+  }, [data?.tracked])
 
   const pageSize = 20
   const trackedTotalPages = Math.max(1, Math.ceil((data?.tracked.length ?? 0) / pageSize))
@@ -512,12 +507,11 @@ function App() {
         <div className="chips">
           {topCandidates.length === 0 ? <span className="muted">No valid candidates yet.</span> : null}
           {topCandidates.map((coin) => {
-            const ageMin = Math.round((coin.coinAgeMs ?? 0) / 60000)
             return (
               <span key={coin.symbol} className="chip">
                 {coin.symbol} | score {coin.analysis.entryScore.toFixed(2)} | mom {coin.analysis.momentumScore.toFixed(2)}
                 | flow {coin.analysis.flowScore.toFixed(2)} | risk {coin.analysis.riskScore.toFixed(2)}
-                | social {coin.social.verdict} | age {ageMin}m
+                | social {coin.social.verdict} | price ${fmtPrice(coin.price)}
               </span>
             )
           })}
@@ -597,8 +591,6 @@ function App() {
         {topCandidates.length === 0 ? <p className="muted">No active buy candidates right now.</p> : null}
         <div className="why-grid">
           {topCandidates.map((coin) => {
-            const maxAgeMin = Math.round((coin.buyChecks.common.maxCoinAgeMs ?? 0) / 60000)
-            const ageMin = Math.round((coin.coinAgeMs ?? 0) / 60000)
             return (
               <article key={`${coin.symbol}-why`} className="why-card">
                 <h3>
@@ -622,9 +614,6 @@ function App() {
                 </p>
                 <p className={`check-line ${checkClass(coin.analysis.riskScore >= coin.buyChecks.common.minRiskScore)}`}>
                   Risk quality {coin.analysis.riskScore.toFixed(2)} {'>='} {coin.buyChecks.common.minRiskScore.toFixed(2)}
-                </p>
-                <p className={`check-line ${checkClass(ageMin <= maxAgeMin)}`}>
-                  Coin age {ageMin}m {'<='} {maxAgeMin}m
                 </p>
               </article>
             )
@@ -662,7 +651,7 @@ function App() {
                     <th>Coin</th>
                     <th>Score</th>
                     <th>Graph</th>
-                    <th>Cap Flow</th>
+                    <th>Coin Price</th>
                     <th>MCap</th>
                     <th>Active Users</th>
                     <th>Buy/Sell</th>
@@ -680,6 +669,7 @@ function App() {
                           <span className="hv-badge">HIGH-VALUE 24H</span>
                         ) : null}
                         <p className="muted">{item.snapshot.name}</p>
+                        <p className="muted">Coin Price ${fmtPrice(item.snapshot.price)}</p>
                         {item.snapshot.trackHighValue24h ? (
                           <p className="muted">Liq ${fmt(item.snapshot.liquidityUsd)}</p>
                         ) : null}
@@ -693,8 +683,8 @@ function App() {
                       <td>
                         <Sparkline points={item.snapshot.priceSeries} className="sparkline-tracked" />
                       </td>
-                      <td className={item.snapshot.capitalFlow >= 0 ? 'up' : 'down'}>
-                        ${fmt(item.snapshot.capitalFlow)}
+                      <td title="Current coin pair price from MEXC market snapshot">
+                        ${fmtPrice(item.snapshot.price)}
                       </td>
                       <td>${fmt(item.snapshot.marketCap)}</td>
                       <td>{fmt(item.snapshot.activeUsers)}</td>
@@ -841,6 +831,17 @@ function App() {
 function fmt(value: number | undefined) {
   if (typeof value !== 'number') return '0'
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value)
+}
+
+function fmtPrice(value: number | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '0'
+  const abs = Math.abs(value)
+  if (abs === 0) return '0'
+  if (abs >= 1000) return value.toFixed(2)
+  if (abs >= 1) return value.toFixed(4)
+  if (abs >= 0.0001) return value.toFixed(6)
+  if (abs >= 0.00000001) return value.toFixed(8)
+  return value.toExponential(4)
 }
 
 function Sparkline({ points, className }: { points: number[]; className?: string }) {
