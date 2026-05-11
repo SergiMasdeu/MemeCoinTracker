@@ -6,12 +6,12 @@
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite",
-    "dev:server": "node --watch --env-file=.env.example server/index.mjs",
+    "dev:server": "node --watch --env-file=.env server/index.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "node --env-file=.env.example server/index.mjs",
-    "start:server": "node --env-file=.env.example server/index.mjs"
+    "start": "node --env-file=.env server/index.mjs",
+    "start:server": "node --env-file=.env server/index.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
