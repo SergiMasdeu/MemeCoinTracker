@@ -203,6 +203,20 @@ if (HAS_CLIENT_BUILD) {
   app.use(express.static(CLIENT_DIST_DIR));
 }
 
+function hasClientBuild() {
+  return fs.existsSync(path.join(CLIENT_DIST_DIR, 'index.html'));
+}
+
+function sendClientIndex(res) {
+  return res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'), (error) => {
+    if (error) {
+      if (!res.headersSent) {
+        res.status(503).send('Frontend build is currently unavailable.');
+      }
+    }
+  });
+}
+
 const marketState = new Map();
 const trackedCoins = new Map();
 const skippedCoins = new Map();
@@ -3047,16 +3061,16 @@ app.get('/api/market', (_req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  if (!HAS_CLIENT_BUILD) {
+  if (!hasClientBuild()) {
     return res.status(404).send('Frontend build not found. Build with "npm run build" before starting the server.');
   }
-  return res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
+  return sendClientIndex(res);
 });
 
 app.get(/^(?!\/api\/).*/, (req, res, next) => {
   if (req.method !== 'GET') return next();
-  if (!HAS_CLIENT_BUILD) return next();
-  return res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
+  if (!hasClientBuild()) return next();
+  return sendClientIndex(res);
 });
 
 app.listen(PORT, async () => {
